@@ -96,36 +96,85 @@ def clean_chat_id(chat_id: str) -> Union[int, str]:
         return int(c)
     if c.isdigit():
         return int(c)
+    # [DEFENSIVE CODING] Auto-prepend @ if the user wrote a username without @ prefix
+    if not c.startswith("@") and not c.startswith("-") and not c.isdigit():
+        if any(char.isalpha() for char in c):
+            return f"@{c}"
     return c
 
 
-async def tg_send_message(chat_id: str, text: str):
+async def tg_send_message(chat_id: str, text: str, auto_delete: bool = False, delay: int = 10):
     global tg_client
+    msg_id = None
+    target_clean = clean_chat_id(chat_id)
+    print(f"[TG_SEND] Sending message to {target_clean}: {text[:60]}...")
+    
     if pyrogram_available and tg_client and tg_client.is_connected:
         try:
-            msg = await tg_client.send_message(chat_id=clean_chat_id(chat_id), text=text)
-            return msg.id
+            msg = await tg_client.send_message(chat_id=target_clean, text=text)
+            msg_id = msg.id
+            print(f"[TG_SEND] Pyrogram message sent! ID: {msg_id}")
+            return msg_id
         except Exception as e:
-            print(f"Pyrogram send_message failed: {e}. Falling back to httpx.")
+            print(f"[TG_SEND] Pyrogram send_message failed: {e}. Falling back to httpx.")
             
     async with httpx.AsyncClient() as client:
-        r = await client.post(f"{TELEGRAM_API}/sendMessage", data={"chat_id": chat_id, "text": text})
-        data = r.json()
-        if data.get("ok"):
-            return data["result"]["message_id"]
-    return None
+        try:
+            r = await client.post(f"{TELEGRAM_API}/sendMessage", data={"chat_id": chat_id, "text": text})
+            data = r.json()
+            if data.get("ok"):
+                msg_id = data["result"]["message_id"]
+                print(f"[TG_SEND] Fallback HTTP message sent! ID: {msg_id}")
+        except Exception as err:
+            print(f"[TG_SEND] Fallback HTTP send failed: {err}")
+                
+    if msg_id and auto_delete:
+        asyncio.create_task(schedule_message_deletion(chat_id, msg_id, delay))
+        
+    return msg_id
+
+
+async def tg_delete_message(chat_id: str, message_id: int):
+    global tg_client
+    target_clean = clean_chat_id(chat_id)
+    print(f"[TG_DELETE] Deleting message {message_id} from {target_clean}")
+    
+    if pyrogram_available and tg_client and tg_client.is_connected:
+        try:
+            await tg_client.delete_messages(chat_id=target_clean, message_ids=message_id)
+            return True
+        except Exception as e:
+            print(f"[TG_DELETE] Pyrogram delete failed: {e}. Falling back to httpx.")
+            
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post(
+                f"{TELEGRAM_API}/deleteMessage",
+                data={"chat_id": chat_id, "message_id": message_id},
+            )
+            return True
+        except Exception as err:
+            print(f"[TG_DELETE] Fallback HTTP delete failed: {err}")
+            return False
+
+
+async def schedule_message_deletion(chat_id: str, message_id: int, delay: int = 10):
+    await asyncio.sleep(delay)
+    await tg_delete_message(chat_id, message_id)
 
 
 async def tg_edit_message(chat_id: str, message_id: int, text: str):
     global tg_client
+    target_clean = clean_chat_id(chat_id)
+    
     if pyrogram_available and tg_client and tg_client.is_connected:
         try:
-            await tg_client.edit_message_text(chat_id=clean_chat_id(chat_id), message_id=message_id, text=text)
+            await tg_client.edit_message_text(chat_id=target_clean, message_id=message_id, text=text)
             return True
         except Exception as e:
             if "MESSAGE_NOT_MODIFIED" in str(e):
                 return True
-            print(f"Pyrogram edit_message failed: {e}. Falling back to httpx.")
+            print(f"[TG_EDIT] Pyrogram edit failed: {e}. Falling back to httpx.")
             
     async with httpx.AsyncClient() as client:
         try:
@@ -133,13 +182,13 @@ async def tg_edit_message(chat_id: str, message_id: int, text: str):
                 f"{TELEGRAM_API}/editMessageText",
                 data={"chat_id": chat_id, "message_id": message_id, "text": text},
             )
-        except Exception:
-            pass
+        except Exception as err:
+            print(f"[TG_EDIT] Fallback HTTP edit failed: {err}")
 
 
 def make_progress_bar(percent: float, length: int = 10) -> str:
     filled = int(round((max(0.0, min(100.0, percent)) / 100) * length))
-    return "■" * filled + "□" * (length - filled)
+    return "■" * filled + "□" * (length - max(0, filled))
 
 
 async def edit_status_throttled(chat_id: str, message_id: int, text: str, force: bool = False):
@@ -174,11 +223,14 @@ async def has_audio_track(file_path: str) -> bool:
 
 
 async def convert_video_to_mp4_with_progress(input_path: str, output_path: str, chat_id: str, message_id: int) -> bool:
+    print(f"[FFMPEG] Starting conversion for {input_path}")
     total_duration = await get_video_duration(input_path)
+    print(f"[FFMPEG] Video total duration: {total_duration}s")
     if total_duration <= 0:
         total_duration = 1.0 # Avoid division by zero
         
     has_audio = await has_audio_track(input_path)
+    print(f"[FFMPEG] Video has audio: {has_audio}")
     
     cmd = [
         "ffmpeg", "-y",
@@ -229,9 +281,11 @@ async def convert_video_to_mp4_with_progress(input_path: str, output_path: str, 
                 await edit_status_throttled(chat_id, message_id, status_text)
                 
         await process.wait()
-        return process.returncode == 0
+        conversion_success = (process.returncode == 0)
+        print(f"[FFMPEG] Conversion complete! Return code: {process.returncode}")
+        return conversion_success
     except Exception as e:
-        print(f"Error converting video with progress: {e}")
+        print(f"[FFMPEG] Error during video conversion: {e}")
         return False
 
 
@@ -251,7 +305,7 @@ async def get_video_duration(file_path: str) -> float:
         stdout, stderr = await process.communicate()
         return float(stdout.strip())
     except Exception as e:
-        print(f"ffprobe exception: {e}")
+        print(f"[FFPROBE] Exception getting video duration: {e}")
         return 0.0
 
 
@@ -284,7 +338,7 @@ async def split_video(file_path: str, segment_duration: float) -> list[str]:
             return sorted(glob.glob("/tmp/part_*.mp4"))
         return [file_path]
     except Exception as e:
-        print(f"split exception: {e}")
+        print(f"[FFMPEG] Video split exception: {e}")
         return [file_path]
 
 
@@ -319,6 +373,8 @@ async def pyrogram_progress_callback(current, total, chat_id, message_id, filena
 
 async def process_and_upload_video(input_path: str, file_name: str, chat_id: str, caption: str = ""):
     global tg_client
+    target_chat = clean_chat_id(chat_id)
+    print(f"[PIPELINE] Starting process_and_upload_video for chat: {target_chat}, file: {file_name}")
     
     # Try to reuse the existing progress message if it exists
     status_msg_id = progress_message_ids.get(chat_id)
@@ -360,6 +416,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
         conversion_failed = True
         upload_path = input_path
         upload_name = file_name
+        print("[PIPELINE] FFMPEG conversion failed or output is missing! Falling back to raw original video.")
         
         status_text = (
             f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
@@ -371,6 +428,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
         )
         await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
     else:
+        print("[PIPELINE] FFMPEG conversion succeeded!")
         try:
             os.remove(input_path)
         except Exception:
@@ -378,6 +436,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
         
     converted_size = os.path.getsize(upload_path)
     limit_2gb = 2000 * 1024 * 1024 # 2000 MB
+    print(f"[PIPELINE] Final file size to upload: {converted_size / (1024*1024):.1f}MB")
     
     # Converting is complete / skipped
     if not conversion_failed:
@@ -393,8 +452,9 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
     
     if pyrogram_available and tg_client and tg_client.is_connected:
         try:
-            target_chat = clean_chat_id(chat_id)
+            print(f"[PIPELINE] Attempting upload via Pyrogram client to chat {target_chat}")
             if converted_size > limit_2gb:
+                print("[PIPELINE] File size is over 2GB. Initiating split-video routine...")
                 status_text = (
                     f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -428,6 +488,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                     for i, part in enumerate(parts):
                         part_name = os.path.basename(part)
                         part_caption = f"{caption}\n\n🎬 Part {i+1} of {len(parts)}"
+                        print(f"[PIPELINE] Uploading split part {i+1}/{len(parts)}: {part_name}")
                         
                         await tg_client.send_video(
                             chat_id=target_chat,
@@ -447,6 +508,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                         progress_args=(chat_id, status_msg_id, upload_name, 1, 1)
                     )
             else:
+                print(f"[PIPELINE] Uploading single video file: {upload_name}")
                 await tg_client.send_video(
                     chat_id=target_chat,
                     video=upload_path,
@@ -466,10 +528,13 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                 f"🎉 **Done! Video convert aur upload ho gaya!**"
             )
             await edit_status_throttled(chat_id, status_msg_id, done_text, force=True)
+            print("[PIPELINE] Video successfully uploaded to Telegram using Pyrogram!")
             
         except Exception as e:
+            print(f"[PIPELINE] Pyrogram Upload Error encountered: {e}")
             await tg_send_message(chat_id, f"❌ Pyrogram Upload Error: {str(e)}")
     else:
+        print("[PIPELINE] Pyrogram Client not available or not connected! Falling back to standard HTTP Bot API.")
         if converted_size > 50 * 1024 * 1024:
             warn_text = (
                 f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
@@ -512,9 +577,12 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                                 f"🎉 **Done! Video standard Bot API se upload ho gaya!**"
                             )
                             await edit_status_throttled(chat_id, status_msg_id, done_text, force=True)
+                            print("[PIPELINE] Video successfully uploaded to Telegram using fallback HTTP Bot API!")
                         else:
+                            print(f"[PIPELINE] Fallback HTTP Bot API send failed! Status: {r.status_code}, Body: {r.text}")
                             await tg_send_message(chat_id, f"❌ Bot API upload failed: {r.text}")
             except Exception as e:
+                print(f"[PIPELINE] Standard Bot API Upload exception: {e}")
                 await tg_send_message(chat_id, f"❌ Standard Bot API Upload Error: {str(e)}")
                 
     # Clean up all temp files
@@ -579,9 +647,15 @@ async def telegram_webhook(secret: str, request: Request):
 
     chat_id = str(message["chat"]["id"])
     text = message.get("text", "").strip()
+    msg_id = message.get("message_id")
+
+    # [AUTO DELETE USER COMMANDS]
+    # Delete the user's incoming command (like /status, /on, /off, /cam) after 10 seconds
+    if text.startswith("/") and msg_id:
+        asyncio.create_task(schedule_message_deletion(chat_id, msg_id, 10))
 
     if text == "/myid":
-        await tg_send_message(chat_id, f"Tumhara chat ID: {chat_id}")
+        await tg_send_message(chat_id, f"Tumhara chat ID: {chat_id}", auto_delete=True, delay=10)
         return {"ok": True}
 
     if chat_id != OWNER_CHAT_ID:
@@ -596,14 +670,15 @@ async def telegram_webhook(secret: str, request: Request):
         await dispatch_command(chat_id, "switch")
     elif cmd == "/status":
         online = "Phone connected, ready" if connected_devices else "Phone offline (app band hai ya net nahi hai)"
-        await tg_send_message(chat_id, online)
+        # Status response will auto-delete in 10 seconds to keep chat clean
+        await tg_send_message(chat_id, online, auto_delete=True, delay=10)
 
     return {"ok": True}
 
 
 async def dispatch_command(chat_id: str, cmd: str):
     if not connected_devices:
-        await tg_send_message(chat_id, "Phone abhi offline hai, app khula hai ya nahi check karo")
+        await tg_send_message(chat_id, "Phone abhi offline hai, app khula hai ya nahi check karo", auto_delete=True, delay=10)
         return
     for ws in list(connected_devices.values()):
         try:
@@ -616,7 +691,9 @@ async def dispatch_command(chat_id: str, cmd: str):
         label = "Command bheja: recording OFF"
     else:
         label = "Command bheja: camera switch"
-    await tg_send_message(chat_id, label)
+        
+    # Command confirmation messages will auto-delete in 10 seconds to keep chat clean
+    await tg_send_message(chat_id, label, auto_delete=True, delay=10)
 
 
 @app.websocket("/ws")
