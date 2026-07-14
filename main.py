@@ -10,8 +10,15 @@ from typing import Dict, Union
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Form, UploadFile, File
-from pyrogram import Client
 from contextlib import asynccontextmanager
+
+# [SAFE IMPORT] Pyrogram import is wrapped to prevent startup crashes if requirements.txt is missing on remote
+try:
+    from pyrogram import Client
+    pyrogram_available = True
+except ImportError:
+    Client = None
+    pyrogram_available = False
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_CHAT_ID = os.environ["OWNER_CHAT_ID"]
@@ -29,7 +36,7 @@ tg_client: Client = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global tg_client
-    if API_ID and API_HASH and BOT_TOKEN:
+    if pyrogram_available and API_ID and API_HASH and BOT_TOKEN:
         try:
             tg_client = Client(
                 "cambot_session",
@@ -44,7 +51,10 @@ async def lifespan(app: FastAPI):
             print(f"Error starting Pyrogram Client: {e}")
             tg_client = None
     else:
-        print("API_ID or API_HASH not found. Pyrogram Client disabled.")
+        if not pyrogram_available:
+            print("WARNING: Pyrogram module not found! Unlimited uploads disabled. Please ensure requirements.txt is fully updated.")
+        else:
+            print("API_ID or API_HASH not found. Pyrogram Client disabled.")
         
     yield
     
@@ -75,7 +85,7 @@ def clean_chat_id(chat_id: str) -> Union[int, str]:
 
 async def tg_send_message(chat_id: str, text: str):
     global tg_client
-    if tg_client and tg_client.is_connected:
+    if pyrogram_available and tg_client and tg_client.is_connected:
         try:
             msg = await tg_client.send_message(chat_id=clean_chat_id(chat_id), text=text)
             return msg.id
@@ -92,18 +102,23 @@ async def tg_send_message(chat_id: str, text: str):
 
 async def tg_edit_message(chat_id: str, message_id: int, text: str):
     global tg_client
-    if tg_client and tg_client.is_connected:
+    if pyrogram_available and tg_client and tg_client.is_connected:
         try:
             await tg_client.edit_message_text(chat_id=clean_chat_id(chat_id), message_id=message_id, text=text)
             return True
         except Exception as e:
+            if "MESSAGE_NOT_MODIFIED" in str(e):
+                return True
             print(f"Pyrogram edit_message failed: {e}. Falling back to httpx.")
             
     async with httpx.AsyncClient() as client:
-        await client.post(
-            f"{TELEGRAM_API}/editMessageText",
-            data={"chat_id": chat_id, "message_id": message_id, "text": text},
-        )
+        try:
+            await client.post(
+                f"{TELEGRAM_API}/editMessageText",
+                data={"chat_id": chat_id, "message_id": message_id, "text": text},
+            )
+        except Exception:
+            pass
 
 
 def make_progress_bar(percent: float, length: int = 10) -> str:
@@ -353,7 +368,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
     )
     await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
     
-    if tg_client and tg_client.is_connected:
+    if pyrogram_available and tg_client and tg_client.is_connected:
         try:
             target_chat = clean_chat_id(chat_id)
             if converted_size > limit_2gb:
@@ -438,7 +453,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                 f"⚙️ Converting: Complete ✅\n"
                 f"⚠️ Uploading: Skipped (File is {converted_size / (1024*1024):.1f}MB)\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Telegram Bot API standard upload limit 50MB hai. Unlimited uploads aur splitting ke liye Koyeb me API_ID aur API_HASH environment variables set karein!"
+                f"Telegram Bot API standard upload limit 50MB hai. Unlimited uploads aur splitting ke liye Koyeb me API_ID aur API_HASH environment variables set karein, aur requirements.txt me pyrogram add karein!"
             )
             await edit_status_throttled(chat_id, status_msg_id, warn_text, force=True)
         else:
@@ -684,13 +699,14 @@ async def telegram_api_proxy(
             
     if not file_field:
         # Fallback to direct proxy if no actual file is present
+        # Since we already called request.form(), we cannot read request.body() anymore.
+        # Instead, we pass the parsed form_data dictionary directly to HTTPX!
         async with httpx.AsyncClient() as client:
-            headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
-            body = await request.body()
+            headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length", "content-type")}
             r = await client.post(
                 f"https://api.telegram.org/bot{token}/{method}",
                 headers=headers,
-                content=body,
+                data=dict(form_data),
                 params=dict(request.query_params)
             )
             try:
