@@ -11,6 +11,7 @@ from typing import Dict, Union
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Form, UploadFile, File
 from contextlib import asynccontextmanager
+from starlette.requests import ClientDisconnect
 
 # [SAFE IMPORT] Pyrogram import is wrapped to prevent startup crashes if requirements.txt is missing on remote
 try:
@@ -557,8 +558,6 @@ async def queue_worker():
                 print(f"Error in queue worker processing: {e}")
                 
             processing_queue.task_done()
-        except asyncio.create_task:  # handle cancel
-            break
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -779,7 +778,11 @@ async def telegram_api_proxy(
                 return r.text
                 
     # Parse form data for media upload methods
-    form_data = await request.form()
+    try:
+        form_data = await request.form()
+    except ClientDisconnect:
+        return {"ok": False, "description": "Client disconnected before upload finished"}
+        
     chat_id = form_data.get("chat_id") or OWNER_CHAT_ID
     caption = form_data.get("caption") or ""
     
