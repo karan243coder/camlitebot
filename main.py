@@ -783,9 +783,11 @@ async def custom_upload(
 ):
     global queued_tasks_count
     form_data = await request.form()
+    
+    # [ROBUST FILE EXTRACTION]
     file_field = None
-    for key, value in form_data.items():
-        if isinstance(value, UploadFile):
+    for key, value in form_data.multi_items():
+        if hasattr(value, "filename") and value.filename:
             file_field = value
             break
             
@@ -863,9 +865,10 @@ async def telegram_api_proxy(
     chat_id = form_data.get("chat_id") or OWNER_CHAT_ID
     caption = form_data.get("caption") or ""
     
+    # [ROBUST FILE EXTRACTION WITH MULTI_ITEMS AND DUCK-TYPING]
     file_field = None
-    for key, value in form_data.items():
-        if isinstance(value, UploadFile):
+    for key, value in form_data.multi_items():
+        if hasattr(value, "filename") and value.filename:
             file_field = value
             break
             
