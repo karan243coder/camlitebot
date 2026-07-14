@@ -103,7 +103,7 @@ def clean_chat_id(chat_id: str) -> Union[int, str]:
     return c
 
 
-async def tg_send_message(chat_id: str, text: str, auto_delete: bool = False, delay: int = 10):
+async def tg_send_message(chat_id: str, text: str, auto_delete: bool = False, delay: int = 5):
     global tg_client
     msg_id = None
     target_clean = clean_chat_id(chat_id)
@@ -114,6 +114,8 @@ async def tg_send_message(chat_id: str, text: str, auto_delete: bool = False, de
             msg = await tg_client.send_message(chat_id=target_clean, text=text)
             msg_id = msg.id
             print(f"[TG_SEND] Pyrogram message sent! ID: {msg_id}")
+            if msg_id and auto_delete:
+                asyncio.create_task(schedule_message_deletion(chat_id, msg_id, delay))
             return msg_id
         except Exception as e:
             print(f"[TG_SEND] Pyrogram send_message failed: {e}. Falling back to httpx.")
@@ -158,7 +160,7 @@ async def tg_delete_message(chat_id: str, message_id: int):
             return False
 
 
-async def schedule_message_deletion(chat_id: str, message_id: int, delay: int = 10):
+async def schedule_message_deletion(chat_id: str, message_id: int, delay: int = 5):
     await asyncio.sleep(delay)
     await tg_delete_message(chat_id, message_id)
 
@@ -371,12 +373,13 @@ async def pyrogram_progress_callback(current, total, chat_id, message_id, filena
     await edit_status_throttled(chat_id, message_id, status_text, force=(current == total))
 
 
-async def process_and_upload_video(input_path: str, file_name: str, chat_id: str, caption: str = ""):
+async def process_and_upload_video(input_path: str, file_name: str, chat_id: str, target_chat: str, caption: str = ""):
     global tg_client
-    target_chat = clean_chat_id(chat_id)
-    print(f"[PIPELINE] Starting process_and_upload_video for chat: {target_chat}, file: {file_name}")
+    target_chat_clean = clean_chat_id(target_chat)
+    status_chat_clean = clean_chat_id(chat_id)
+    print(f"[PIPELINE] Starting process_and_upload_video. Status Chat: {status_chat_clean}, Video Target Chat: {target_chat_clean}, file: {file_name}")
     
-    # Try to reuse the existing progress message if it exists
+    # Try to reuse the existing progress message if it exists (which is in OWNER_CHAT_ID / status_chat_clean)
     status_msg_id = progress_message_ids.get(chat_id)
     if not status_msg_id:
         status_msg_id = await tg_send_message(chat_id, "⚙️ Processing: Video process ho raha hai...")
@@ -452,7 +455,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
     
     if pyrogram_available and tg_client and tg_client.is_connected:
         try:
-            print(f"[PIPELINE] Attempting upload via Pyrogram client to chat {target_chat}")
+            print(f"[PIPELINE] Attempting upload via Pyrogram client to target chat {target_chat_clean}")
             if converted_size > limit_2gb:
                 print("[PIPELINE] File size is over 2GB. Initiating split-video routine...")
                 status_text = (
@@ -491,7 +494,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                         print(f"[PIPELINE] Uploading split part {i+1}/{len(parts)}: {part_name}")
                         
                         await tg_client.send_video(
-                            chat_id=target_chat,
+                            chat_id=target_chat_clean,
                             video=part,
                             caption=part_caption,
                             supports_streaming=True, # [STREAMING FIX] Tells Telegram to enable in-app streaming
@@ -500,7 +503,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                         )
                 else:
                     await tg_client.send_video(
-                        chat_id=target_chat,
+                        chat_id=target_chat_clean,
                         video=upload_path,
                         caption=caption,
                         supports_streaming=True, # [STREAMING FIX] Tells Telegram to enable in-app streaming
@@ -510,7 +513,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
             else:
                 print(f"[PIPELINE] Uploading single video file: {upload_name}")
                 await tg_client.send_video(
-                    chat_id=target_chat,
+                    chat_id=target_chat_clean,
                     video=upload_path,
                     caption=caption,
                     supports_streaming=True, # [STREAMING FIX] Tells Telegram to enable in-app streaming
@@ -561,7 +564,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                     with open(upload_path, "rb") as f:
                         files = {"video": (upload_name, f, "video/mp4")}
                         data = {
-                            "chat_id": chat_id, 
+                            "chat_id": target_chat, # The final video destination!
                             "caption": caption,
                             "supports_streaming": "true" # [STREAMING FIX] Tells Telegram Bot API to support streaming
                         }
@@ -617,11 +620,12 @@ async def queue_worker():
             
             input_path = item["input_path"]
             file_name = item["file_name"]
-            chat_id = item["chat_id"]
+            chat_id = item["chat_id"]         # Progress/Status Chat (Always OWNER_CHAT_ID)
+            target_chat = item["target_chat"] # Video Destination Chat (Can be Channel ID or Owner ID)
             caption = item["caption"]
             
             try:
-                await process_and_upload_video(input_path, file_name, chat_id, caption)
+                await process_and_upload_video(input_path, file_name, chat_id, target_chat, caption)
             except Exception as e:
                 print(f"Error in queue worker processing: {e}")
                 
@@ -650,12 +654,12 @@ async def telegram_webhook(secret: str, request: Request):
     msg_id = message.get("message_id")
 
     # [AUTO DELETE USER COMMANDS]
-    # Delete the user's incoming command (like /status, /on, /off, /cam) after 10 seconds
+    # Delete the user's incoming command (like /status, /on, /off, /cam) after 5 seconds to keep DM clean
     if text.startswith("/") and msg_id:
-        asyncio.create_task(schedule_message_deletion(chat_id, msg_id, 10))
+        asyncio.create_task(schedule_message_deletion(chat_id, msg_id, 5))
 
     if text == "/myid":
-        await tg_send_message(chat_id, f"Tumhara chat ID: {chat_id}", auto_delete=True, delay=10)
+        await tg_send_message(chat_id, f"Tumhara chat ID: {chat_id}", auto_delete=True, delay=5)
         return {"ok": True}
 
     if chat_id != OWNER_CHAT_ID:
@@ -670,15 +674,15 @@ async def telegram_webhook(secret: str, request: Request):
         await dispatch_command(chat_id, "switch")
     elif cmd == "/status":
         online = "Phone connected, ready" if connected_devices else "Phone offline (app band hai ya net nahi hai)"
-        # Status response will auto-delete in 10 seconds to keep chat clean
-        await tg_send_message(chat_id, online, auto_delete=True, delay=10)
+        # Status response will auto-delete in 5 seconds to keep chat clean
+        await tg_send_message(chat_id, online, auto_delete=True, delay=5)
 
     return {"ok": True}
 
 
 async def dispatch_command(chat_id: str, cmd: str):
     if not connected_devices:
-        await tg_send_message(chat_id, "Phone abhi offline hai, app khula hai ya nahi check karo", auto_delete=True, delay=10)
+        await tg_send_message(chat_id, "Phone abhi offline hai, app khula hai ya nahi check karo", auto_delete=True, delay=5)
         return
     for ws in list(connected_devices.values()):
         try:
@@ -692,8 +696,8 @@ async def dispatch_command(chat_id: str, cmd: str):
     else:
         label = "Command bheja: camera switch"
         
-    # Command confirmation messages will auto-delete in 10 seconds to keep chat clean
-    await tg_send_message(chat_id, label, auto_delete=True, delay=10)
+    # Command confirmation messages will auto-delete in 5 seconds to keep chat clean
+    await tg_send_message(chat_id, label, auto_delete=True, delay=5)
 
 
 @app.websocket("/ws")
@@ -728,7 +732,8 @@ async def ws_endpoint(websocket: WebSocket):
 
 
 async def handle_device_event(data: dict):
-    chat_id = data.get("chat_id") or OWNER_CHAT_ID
+    # Always redirect the phone's status/progress updates to the OWNER'S PERSONAL CHAT!
+    chat_id = OWNER_CHAT_ID
     event = data.get("event")
 
     if event == "status":
@@ -801,12 +806,12 @@ async def custom_upload(
     with open(temp_input_path, "wb") as buffer:
         shutil.copyfileobj(file_field.file, buffer)
         
-    # Put task in Queue to prevent server overload
-    status_msg_id = progress_message_ids.get(target_chat)
+    # We ALWAYS send status and progress messages to OWNER_CHAT_ID!
+    status_msg_id = progress_message_ids.get(OWNER_CHAT_ID)
     if not status_msg_id:
-        status_msg_id = await tg_send_message(target_chat, "⚙️ Processing: Video server par aa gaya hai...")
+        status_msg_id = await tg_send_message(OWNER_CHAT_ID, "⚙️ Processing: Video server par aa gaya hai...")
         if status_msg_id:
-            progress_message_ids[target_chat] = status_msg_id
+            progress_message_ids[OWNER_CHAT_ID] = status_msg_id
             
     if queued_tasks_count > 0:
         status_text = (
@@ -816,14 +821,15 @@ async def custom_upload(
             f"⏳ Queue Position: #{queued_tasks_count} (Server busy hai, line me laga diya gaya hai...)\n"
             f"━━━━━━━━━━━━━━━━━━━━━━"
         )
-        await edit_status_throttled(target_chat, status_msg_id, status_text, force=True)
+        await edit_status_throttled(OWNER_CHAT_ID, status_msg_id, status_text, force=True)
         
     queued_tasks_count += 1
     
     item = {
         "input_path": temp_input_path,
         "file_name": file_name,
-        "chat_id": target_chat,
+        "chat_id": OWNER_CHAT_ID,      # Status updates go to Owner's Chat
+        "target_chat": target_chat,    # Final video goes to requested chat (Channel)
         "caption": caption
     }
     await processing_queue.put(item)
@@ -896,12 +902,13 @@ async def telegram_api_proxy(
     with open(temp_input_path, "wb") as buffer:
         shutil.copyfileobj(file_field.file, buffer)
         
-    # Queue status configuration
-    status_msg_id = progress_message_ids.get(chat_id)
+    # [SEPARATION FIX] We ALWAYS send status and progress messages to OWNER_CHAT_ID (the private Bot DM)!
+    # But the video file goes to 'chat_id' (which contains the Channel ID!)
+    status_msg_id = progress_message_ids.get(OWNER_CHAT_ID)
     if not status_msg_id:
-        status_msg_id = await tg_send_message(chat_id, "⚙️ Processing: Video server par aa gaya hai...")
+        status_msg_id = await tg_send_message(OWNER_CHAT_ID, "⚙️ Processing: Video server par aa gaya hai...")
         if status_msg_id:
-            progress_message_ids[chat_id] = status_msg_id
+            progress_message_ids[OWNER_CHAT_ID] = status_msg_id
             
     if queued_tasks_count > 0:
         status_text = (
@@ -911,14 +918,15 @@ async def telegram_api_proxy(
             f"⏳ Queue Position: #{queued_tasks_count} (Server busy hai, line me laga diya gaya hai...)\n"
             f"━━━━━━━━━━━━━━━━━━━━━━"
         )
-        await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
+        await edit_status_throttled(OWNER_CHAT_ID, status_msg_id, status_text, force=True)
         
     queued_tasks_count += 1
     
     item = {
         "input_path": temp_input_path,
         "file_name": file_name,
-        "chat_id": chat_id,
+        "chat_id": OWNER_CHAT_ID,      # Status updates go to Owner's Chat
+        "target_chat": chat_id,        # Final video goes to Channel
         "caption": caption
     }
     await processing_queue.put(item)
