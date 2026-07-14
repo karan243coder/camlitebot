@@ -432,6 +432,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                             chat_id=target_chat,
                             video=part,
                             caption=part_caption,
+                            supports_streaming=True, # [STREAMING FIX] Tells Telegram to enable in-app streaming
                             progress=pyrogram_progress_callback,
                             progress_args=(chat_id, status_msg_id, part_name, i+1, len(parts))
                         )
@@ -440,6 +441,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                         chat_id=target_chat,
                         video=upload_path,
                         caption=caption,
+                        supports_streaming=True, # [STREAMING FIX] Tells Telegram to enable in-app streaming
                         progress=pyrogram_progress_callback,
                         progress_args=(chat_id, status_msg_id, upload_name, 1, 1)
                     )
@@ -448,6 +450,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                     chat_id=target_chat,
                     video=upload_path,
                     caption=caption,
+                    supports_streaming=True, # [STREAMING FIX] Tells Telegram to enable in-app streaming
                     progress=pyrogram_progress_callback,
                     progress_args=(chat_id, status_msg_id, upload_name, 1, 1)
                 )
@@ -491,7 +494,11 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                 async with httpx.AsyncClient() as client:
                     with open(upload_path, "rb") as f:
                         files = {"video": (upload_name, f, "video/mp4")}
-                        data = {"chat_id": chat_id, "caption": caption}
+                        data = {
+                            "chat_id": chat_id, 
+                            "caption": caption,
+                            "supports_streaming": "true" # [STREAMING FIX] Tells Telegram Bot API to support streaming
+                        }
                         r = await client.post(f"{TELEGRAM_API}/sendVideo", data=data, files=files, timeout=None)
                         if r.status_code == 200 and r.json().get("ok"):
                             done_text = (
@@ -550,6 +557,8 @@ async def queue_worker():
                 print(f"Error in queue worker processing: {e}")
                 
             processing_queue.task_done()
+        except asyncio.create_task:  # handle cancel
+            break
         except asyncio.CancelledError:
             break
         except Exception as e:
