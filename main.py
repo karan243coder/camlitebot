@@ -39,7 +39,7 @@ MAX_CONCURRENT_TASKS = 1
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 # [ADMIN SECURITY] Admin whitelist
-ADMIN_IDS: Set[str] = {OWNER_CHAT_ID}  # Only owner is admin
+ADMIN_IDS: Set[str] = {OWNER_CHAT_ID}
 
 
 def is_admin(chat_id: str) -> bool:
@@ -194,6 +194,83 @@ async def edit_status_throttled(chat_id: str, message_id: int, text: str, force:
         except:
             pass
 
+
+# ============================================================
+# [NEW] PHOTO UPLOAD HANDLER
+# ============================================================
+
+async def upload_photo_to_telegram(file_path: str, file_name: str, chat_id: str, target_chat: str, caption: str = ""):
+    """Upload photo to Telegram immediately (no conversion needed)"""
+    global tg_client
+    target_chat_clean = clean_chat_id(target_chat)
+    
+    status_msg_id = progress_message_ids.get(chat_id)
+    if not status_msg_id:
+        status_msg_id = await tg_send_message(chat_id, "📸 Photo uploading...")
+        if status_msg_id:
+            progress_message_ids[chat_id] = status_msg_id
+    
+    status_text = f"📸 **[ PHOTO DELIVERY ]** 📸\n━━━━━━━━━━━━━━━━━━━━━━\n📤 Uploading photo... ⏳\n━━━━━━━━━━━━━━━━━━━━━━"
+    await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
+    
+    sent = False
+    
+    # Try Pyrogram first
+    if pyrogram_available and tg_client and tg_client.is_connected:
+        try:
+            try:
+                await tg_client.get_chat(target_chat_clean)
+            except:
+                pass
+            
+            await tg_client.send_photo(
+                chat_id=target_chat_clean,
+                photo=file_path,
+                caption=caption
+            )
+            sent = True
+            print(f"[PHOTO] Sent via Pyrogram: {file_name}")
+        except Exception as e:
+            print(f"[PHOTO] Pyrogram failed: {e}")
+    
+    # Fallback to HTTP
+    if not sent:
+        try:
+            async with httpx.AsyncClient() as client:
+                with open(file_path, "rb") as f:
+                    files = {"photo": (file_name, f, "image/jpeg")}
+                    data = {"chat_id": target_chat, "caption": caption}
+                    r = await client.post(f"{TELEGRAM_API}/sendPhoto", data=data, files=files, timeout=60)
+                    if r.status_code == 200 and r.json().get("ok", False):
+                        sent = True
+                        print(f"[PHOTO] Sent via HTTP: {file_name}")
+        except Exception as e:
+            print(f"[PHOTO] HTTP failed: {e}")
+    
+    if sent:
+        done_text = f"📸 **[ PHOTO DELIVERED ]** 📸\n━━━━━━━━━━━━━━━━━━━━━━\n✅ Photo: {file_name}\n━━━━━━━━━━━━━━━━━━━━━━"
+    else:
+        done_text = f"📸 **[ PHOTO FAILED ]** 📸\n━━━━━━━━━━━━━━━━━━━━━━\n❌ Upload failed\n━━━━━━━━━━━━━━━━━━━━━━"
+    
+    await edit_status_throttled(chat_id, status_msg_id, done_text, force=True)
+    
+    # Cleanup
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except:
+        pass
+    
+    progress_message_ids.pop(chat_id, None)
+    last_edit_timestamps.pop(f"{chat_id}_{status_msg_id}", None)
+    gc.collect()
+    
+    return sent
+
+
+# ============================================================
+# VIDEO PROCESSING (Same as before)
+# ============================================================
 
 async def has_audio_track(file_path: str) -> bool:
     cmd = ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
@@ -559,10 +636,11 @@ async def queue_worker():
             queued_tasks_count = max(0, queued_tasks_count - 1)
             queue_position = item.get("queue_position", 1)
             
-            try:
+            # [NEW] Check if it's a photo or video
+            if item.get("type") == "photo":
+                await upload_photo_to_telegram(item["input_path"], item["file_name"], item["chat_id"], item["target_chat"], item["caption"])
+            else:
                 await process_and_upload_video(item["input_path"], item["file_name"], item["chat_id"], item["target_chat"], item["caption"], queue_position)
-            except Exception as e:
-                print(f"Worker error: {e}")
             
             processing_queue.task_done()
         except asyncio.CancelledError:
@@ -587,7 +665,6 @@ async def telegram_webhook(secret: str, request: Request):
     
     # [ADMIN SECURITY] Check if user is admin
     if not is_admin(chat_id):
-        # Non-admin user - send access denied message
         await tg_send_message(
             chat_id,
             "🚫 **Access Denied**\n\nYou are not authorized to use this bot.\nOnly the owner can control this security camera.",
@@ -597,7 +674,6 @@ async def telegram_webhook(secret: str, request: Request):
         print(f"[SECURITY] Blocked non-admin user: {chat_id}")
         return {"ok": True}
     
-    # [ADMIN ONLY] Process admin commands
     if text.startswith("/") and msg_id:
         asyncio.create_task(schedule_message_deletion(chat_id, msg_id, 5))
     
@@ -611,13 +687,14 @@ async def telegram_webhook(secret: str, request: Request):
             "/on - Start recording\n"
             "/off - Stop recording\n"
             "/switch - Switch camera (front/back)\n"
+            "/photo - Take a photo 📸\n"  # [NEW]
             "/status - Check phone connection\n"
             "/myid - Show your chat ID\n"
             "/help - Show this help\n\n"
             "✅ You are authorized admin"
         )
         await tg_send_message(chat_id, help_text, auto_delete=True, delay=30)
-        return {"ok": True"}
+        return {"ok": True}
     
     cmd = text.lower()
     if cmd in ("/on", "/startcam", "/start_rec"):
@@ -626,6 +703,8 @@ async def telegram_webhook(secret: str, request: Request):
         await dispatch_command(chat_id, "stop")
     elif cmd in ("/switchcam", "/switch", "/cam"):
         await dispatch_command(chat_id, "switch")
+    elif cmd == "/photo":  # [NEW] Photo command
+        await dispatch_command(chat_id, "photo")
     elif cmd == "/status":
         online = "Phone connected" if connected_devices else "Phone offline"
         await tg_send_message(chat_id, online, auto_delete=True, delay=5)
@@ -642,7 +721,12 @@ async def dispatch_command(chat_id: str, cmd: str):
             await ws.send_json({"cmd": cmd, "chat_id": chat_id})
         except:
             pass
-    labels = {"start": "Recording ON", "stop": "Recording OFF", "switch": "Camera switch"}
+    labels = {
+        "start": "Recording ON",
+        "stop": "Recording OFF",
+        "switch": "Camera switch",
+        "photo": "📸 Taking photo..."  # [NEW]
+    }
     await tg_send_message(chat_id, f"Command: {labels.get(cmd, cmd)}", auto_delete=True, delay=5)
 
 
@@ -701,7 +785,12 @@ async def handle_device_event(data: dict):
 
 
 @app.post("/upload")
-async def custom_upload(request: Request, chat_id: str = Form(None), caption: str = Form("")):
+async def custom_upload(
+    request: Request,
+    chat_id: str = Form(None),
+    caption: str = Form(""),
+    file_type: str = Form("video")  # [NEW] Support photo upload
+):
     global queued_tasks_count
     form_data = await request.form()
     file_field = None
@@ -711,9 +800,11 @@ async def custom_upload(request: Request, chat_id: str = Form(None), caption: st
             break
     if not file_field:
         return {"ok": False}
+    
     target_chat = chat_id or OWNER_CHAT_ID
-    file_name = file_field.filename or "video.mp4"
+    file_name = file_field.filename or ("photo.jpg" if file_type == "photo" else "video.mp4")
     temp_input_path = f"/tmp/{file_name}"
+    
     with open(temp_input_path, "wb") as buffer:
         shutil.copyfileobj(file_field.file, buffer)
     
@@ -722,7 +813,8 @@ async def custom_upload(request: Request, chat_id: str = Form(None), caption: st
     
     status_msg_id = progress_message_ids.get(OWNER_CHAT_ID)
     if not status_msg_id:
-        status_msg_id = await tg_send_message(OWNER_CHAT_ID, f"⚙️ Queued #{queue_position}...")
+        emoji = "📸" if file_type == "photo" else "⚙️"
+        status_msg_id = await tg_send_message(OWNER_CHAT_ID, f"{emoji} Queued #{queue_position}...")
         if status_msg_id:
             progress_message_ids[OWNER_CHAT_ID] = status_msg_id
     
@@ -732,7 +824,8 @@ async def custom_upload(request: Request, chat_id: str = Form(None), caption: st
         "chat_id": OWNER_CHAT_ID,
         "target_chat": target_chat,
         "caption": caption,
-        "queue_position": queue_position
+        "queue_position": queue_position,
+        "type": file_type  # [NEW] "photo" or "video"
     })
     
     return {"ok": True, "queue_position": queue_position}
@@ -792,7 +885,8 @@ async def telegram_api_proxy(token: str, method: str, request: Request):
         "chat_id": OWNER_CHAT_ID,
         "target_chat": chat_id,
         "caption": caption,
-        "queue_position": queue_position
+        "queue_position": queue_position,
+        "type": "video"
     })
     
     return {"ok": True, "result": {"message_id": 99999, "chat": {"id": int(chat_id) if str(chat_id).replace("-", "").isdigit() else 0, "type": "private"}, "date": int(time.time()), "text": f"Queued #{queue_position}"}}
