@@ -6,6 +6,7 @@ import shutil
 import glob
 import json
 import re
+import gc
 from typing import Dict, Union
 
 import httpx
@@ -234,8 +235,10 @@ async def convert_video_to_mp4_with_progress(input_path: str, output_path: str, 
     has_audio = await has_audio_track(input_path)
     print(f"[FFMPEG] Video has audio: {has_audio}")
     
+    # [RAM OPTIMIZATION] Restricting threads to 1 to stay within Koyeb 500MB limits
     cmd = [
         "ffmpeg", "-y",
+        "-threads", "1",
         "-i", input_path,
         "-c:v", "libx264",
         "-preset", "superfast",
@@ -322,6 +325,7 @@ async def split_video(file_path: str, segment_duration: float) -> list[str]:
             
     cmd = [
         "ffmpeg", "-y",
+        "-threads", "1",
         "-i", file_path,
         "-c", "copy",
         "-map", "0",
@@ -343,6 +347,33 @@ async def split_video(file_path: str, segment_duration: float) -> list[str]:
     except Exception as e:
         print(f"[FFMPEG] Video split exception: {e}")
         return [file_path]
+
+
+# [NEW FEATURE] Automatic Video Thumbnail Generation
+async def generate_video_thumbnail(video_path: str, thumbnail_path: str) -> bool:
+    print(f"[THUMBNAIL] Generating thumbnail for {video_path}...")
+    cmd = [
+        "ffmpeg", "-y",
+        "-threads", "1",
+        "-ss", "00:00:02", # Seek 2s in to skip initial black/dark frames
+        "-i", video_path,
+        "-vframes", "1",
+        "-q:v", "2",
+        thumbnail_path
+    ]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await process.wait()
+        success = (process.returncode == 0)
+        print(f"[THUMBNAIL] Generation complete! Status: {success}")
+        return success
+    except Exception as e:
+        print(f"[THUMBNAIL] Exception generating thumbnail: {e}")
+        return False
 
 
 async def pyrogram_progress_callback(current, total, chat_id, message_id, filename, current_part, total_parts):
@@ -442,6 +473,14 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
     limit_2gb = 2000 * 1024 * 1024 # 2000 MB
     print(f"[PIPELINE] Final file size to upload: {converted_size / (1024*1024):.1f}MB")
     
+    # [THUMBNAIL PROCESS] Extraction
+    thumb_path = f"/tmp/{base}_thumb.jpg"
+    has_thumb = await generate_video_thumbnail(upload_path, thumb_path)
+    if not has_thumb or not os.path.exists(thumb_path) or os.path.getsize(thumb_path) == 0:
+        thumb_path = None
+    else:
+        print(f"[PIPELINE] Video thumbnail generated successfully at {thumb_path}")
+    
     # Converting is complete / skipped
     if not conversion_failed:
         status_text = (
@@ -508,6 +547,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                             video=part,
                             caption=part_caption,
                             supports_streaming=True, # [STREAMING FIX] Tells Telegram to enable in-app streaming
+                            thumb=thumb_path, # [NEW FEATURE] Beautiful auto-generated video thumbnail
                             progress=pyrogram_progress_callback,
                             progress_args=(chat_id, status_msg_id, part_name, i+1, len(parts))
                         )
@@ -517,6 +557,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                         video=upload_path,
                         caption=caption,
                         supports_streaming=True, # [STREAMING FIX] Tells Telegram to enable in-app streaming
+                        thumb=thumb_path, # [NEW FEATURE] Beautiful auto-generated video thumbnail
                         progress=pyrogram_progress_callback,
                         progress_args=(chat_id, status_msg_id, upload_name, 1, 1)
                     )
@@ -527,6 +568,7 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                     video=upload_path,
                     caption=caption,
                     supports_streaming=True, # [STREAMING FIX] Tells Telegram to enable in-app streaming
+                    thumb=thumb_path, # [NEW FEATURE] Beautiful auto-generated video thumbnail
                     progress=pyrogram_progress_callback,
                     progress_args=(chat_id, status_msg_id, upload_name, 1, 1)
                 )
@@ -563,6 +605,11 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                     async with httpx.AsyncClient() as client:
                         with open(upload_path, "rb") as f:
                             files = {"video": (upload_name, f, "video/mp4")}
+                            # [THUMBNAIL ADD FOR HTTP FALLBACK]
+                            if thumb_path:
+                                with open(thumb_path, "rb") as t_file:
+                                    files["thumb"] = (os.path.basename(thumb_path), t_file, "image/jpeg")
+                                    
                             data = {
                                 "chat_id": target_chat,
                                 "caption": caption,
@@ -614,6 +661,10 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                 async with httpx.AsyncClient() as client:
                     with open(upload_path, "rb") as f:
                         files = {"video": (upload_name, f, "video/mp4")}
+                        if thumb_path:
+                            with open(thumb_path, "rb") as t_file:
+                                files["thumb"] = (os.path.basename(thumb_path), t_file, "image/jpeg")
+                                
                         data = {
                             "chat_id": target_chat, # The final video destination!
                             "caption": caption,
@@ -640,9 +691,9 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
                 await tg_send_message(chat_id, f"❌ Standard Bot API Upload Error: {str(e)}")
                 
     # Clean up all temp files
-    for path in [input_path, temp_output_path]:
+    for path in [input_path, temp_output_path, thumb_path]:
         try:
-            if os.path.exists(path):
+            if path and os.path.exists(path):
                 os.remove(path)
         except Exception:
             pass
@@ -657,6 +708,10 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
     progress_message_ids.pop(chat_id, None)
     last_progress_edit.pop(f"{chat_id}_{status_msg_id}", None)
     last_edit_timestamps.pop(f"{chat_id}_{status_msg_id}", None)
+    
+    # [RAM OPTIMIZATION] Explicitly trigger python garbage collection to free RAM on 500MB instances
+    gc.collect()
+    print("[PIPELINE] Clean up done and Garbage Collection triggered successfully!")
     
     return True
 
