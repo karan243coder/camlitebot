@@ -7,7 +7,7 @@ import glob
 import json
 import re
 import gc
-from typing import Dict, Union
+from typing import Dict, Union, Set
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Form, UploadFile, File
@@ -38,6 +38,14 @@ queued_tasks_count = 0
 MAX_CONCURRENT_TASKS = 1
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
+# [ADMIN SECURITY] Admin whitelist
+ADMIN_IDS: Set[str] = {OWNER_CHAT_ID}  # Only owner is admin
+
+
+def is_admin(chat_id: str) -> bool:
+    """Check if user is admin (owner or whitelisted)"""
+    return str(chat_id) in ADMIN_IDS
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -62,6 +70,7 @@ async def lifespan(app: FastAPI):
 
     worker_task = asyncio.create_task(queue_worker())
     print("✓ Queue worker started (1 video at a time)")
+    print(f"✓ Admin-only mode: Only {OWNER_CHAT_ID} can control bot")
     
     yield
     
@@ -371,11 +380,9 @@ async def send_original_fast(input_path, file_name, chat_id, target_chat, captio
     if not has_thumb or not os.path.exists(thumb_path) or os.path.getsize(thumb_path) == 0:
         thumb_path = None
 
-    # [QUEUE] Show queue position
     if queue_position > 1:
         status_text = f"📊 **[ QUEUE ]** 📊\n━━━━━━━━━━━━━━━━━━━━━━\n⏳ Position: #{queue_position}\n📥 Received: Complete ✅\n📤 Waiting for turn...\n━━━━━━━━━━━━━━━━━━━━━━"
         await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
-        # Wait for semaphore
         await semaphore.acquire()
         semaphore.release()
     
@@ -573,16 +580,45 @@ async def telegram_webhook(secret: str, request: Request):
     message = update.get("message")
     if not message:
         return {"ok": True}
+    
     chat_id = str(message["chat"]["id"])
     text = message.get("text", "").strip()
     msg_id = message.get("message_id")
+    
+    # [ADMIN SECURITY] Check if user is admin
+    if not is_admin(chat_id):
+        # Non-admin user - send access denied message
+        await tg_send_message(
+            chat_id,
+            "🚫 **Access Denied**\n\nYou are not authorized to use this bot.\nOnly the owner can control this security camera.",
+            auto_delete=True,
+            delay=10
+        )
+        print(f"[SECURITY] Blocked non-admin user: {chat_id}")
+        return {"ok": True}
+    
+    # [ADMIN ONLY] Process admin commands
     if text.startswith("/") and msg_id:
         asyncio.create_task(schedule_message_deletion(chat_id, msg_id, 5))
+    
     if text == "/myid":
-        await tg_send_message(chat_id, f"Chat ID: {chat_id}", auto_delete=True, delay=5)
+        await tg_send_message(chat_id, f"✅ Your Chat ID: {chat_id}\n\nYou are ADMIN ✓", auto_delete=True, delay=10)
         return {"ok": True}
-    if chat_id != OWNER_CHAT_ID:
-        return {"ok": True}
+    
+    if text == "/help":
+        help_text = (
+            "🔒 **Security Cam Bot - Admin Commands**\n\n"
+            "/on - Start recording\n"
+            "/off - Stop recording\n"
+            "/switch - Switch camera (front/back)\n"
+            "/status - Check phone connection\n"
+            "/myid - Show your chat ID\n"
+            "/help - Show this help\n\n"
+            "✅ You are authorized admin"
+        )
+        await tg_send_message(chat_id, help_text, auto_delete=True, delay=30)
+        return {"ok": True"}
+    
     cmd = text.lower()
     if cmd in ("/on", "/startcam", "/start_rec"):
         await dispatch_command(chat_id, "start")
@@ -593,6 +629,7 @@ async def telegram_webhook(secret: str, request: Request):
     elif cmd == "/status":
         online = "Phone connected" if connected_devices else "Phone offline"
         await tg_send_message(chat_id, online, auto_delete=True, delay=5)
+    
     return {"ok": True}
 
 
@@ -763,4 +800,4 @@ async def telegram_api_proxy(token: str, method: str, request: Request):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "devices": len(connected_devices), "queue": queued_tasks_count}
+    return {"status": "ok", "devices": len(connected_devices), "queue": queued_tasks_count, "admin_only": True}
