@@ -250,9 +250,10 @@ async def convert_video_to_mp4_with_progress(input_path: str, output_path: str, 
     cmd.extend(["-movflags", "+faststart", output_path])
     
     try:
+        # [CRITICAL DEADLOCK FIX] stdout is set to DEVNULL instead of PIPE to prevent subprocess hangs
         process = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE
         )
         
@@ -455,6 +456,15 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
     
     if pyrogram_available and tg_client and tg_client.is_connected:
         try:
+            # [CRITICAL PEER RESOLVE FIX] Bots in MTProto (Pyrogram) throw "Peer id invalid" if they haven't resolved the channel peer before.
+            # Calling get_chat forces the bot to query Telegram servers, resolve the peer ID, and cache it!
+            try:
+                print(f"[PIPELINE] Resolving chat peer for {target_chat_clean} in Pyrogram...")
+                await tg_client.get_chat(target_chat_clean)
+                print("[PIPELINE] Chat peer resolved successfully!")
+            except Exception as pe:
+                print(f"[PIPELINE] Failed to resolve chat peer via Pyrogram get_chat: {pe}. Proceeding anyway.")
+
             print(f"[PIPELINE] Attempting upload via Pyrogram client to target chat {target_chat_clean}")
             if converted_size > limit_2gb:
                 print("[PIPELINE] File size is over 2GB. Initiating split-video routine...")
@@ -534,8 +544,49 @@ async def process_and_upload_video(input_path: str, file_name: str, chat_id: str
             print("[PIPELINE] Video successfully uploaded to Telegram using Pyrogram!")
             
         except Exception as e:
-            print(f"[PIPELINE] Pyrogram Upload Error encountered: {e}")
-            await tg_send_message(chat_id, f"❌ Pyrogram Upload Error: {str(e)}")
+            print(f"[PIPELINE] Pyrogram Upload Error encountered: {e}. Falling back to standard HTTP Bot API.")
+            # [CRITICAL FALLBACK TO BOT API IF PYROGRAM FAILS TO POST TO CHANNEL]
+            # Since HTTP Bot API never has "Peer id invalid" issues, we fall back to it immediately!
+            if converted_size > 50 * 1024 * 1024:
+                await tg_send_message(chat_id, f"❌ Pyrogram Upload Error (File >50MB cannot fallback): {str(e)}")
+            else:
+                status_text = (
+                    f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📥 Receiving: Complete ✅\n"
+                    f"⚙️ Converting: {'Complete ✅' if not conversion_failed else 'Failed ⚠️'}\n"
+                    f"📤 Uploading: Pyrogram failed. Retrying via HTTP Bot API... ⏳\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━"
+                )
+                await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
+                try:
+                    async with httpx.AsyncClient() as client:
+                        with open(upload_path, "rb") as f:
+                            files = {"video": (upload_name, f, "video/mp4")}
+                            data = {
+                                "chat_id": target_chat,
+                                "caption": caption,
+                                "supports_streaming": "true"
+                            }
+                            r = await client.post(f"{TELEGRAM_API}/sendVideo", data=data, files=files, timeout=None)
+                            if r.status_code == 200 and r.json().get("ok"):
+                                done_text = (
+                                    f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+                                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                    f"📥 Receiving: Complete ✅\n"
+                                    f"⚙️ Converting: {'Complete ✅' if not conversion_failed else 'Failed (Uploaded Raw) ⚠️'}\n"
+                                    f"📤 Uploading: Complete ✅\n"
+                                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                    f"🎉 **Done! Video standard Bot API se upload ho gaya!**"
+                                )
+                                await edit_status_throttled(chat_id, status_msg_id, done_text, force=True)
+                                print("[PIPELINE] Video successfully uploaded to Telegram using fallback HTTP Bot API after Pyrogram failed!")
+                            else:
+                                print(f"[PIPELINE] Fallback HTTP Bot API send failed! Status: {r.status_code}, Body: {r.text}")
+                                await tg_send_message(chat_id, f"❌ Bot API upload failed: {r.text}")
+                except Exception as ex:
+                    print(f"[PIPELINE] Standard Bot API Upload exception: {ex}")
+                    await tg_send_message(chat_id, f"❌ Standard Bot API Upload Error: {str(ex)}")
     else:
         print("[PIPELINE] Pyrogram Client not available or not connected! Falling back to standard HTTP Bot API.")
         if converted_size > 50 * 1024 * 1024:
