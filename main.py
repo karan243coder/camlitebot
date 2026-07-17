@@ -6,14 +6,14 @@ import shutil
 import glob
 import json
 import re
-import gc
-from typing import Dict, Union, Set
+from typing import Dict, Union
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Form, UploadFile, File
 from contextlib import asynccontextmanager
 from starlette.requests import ClientDisconnect
 
+# [SAFE IMPORT] Pyrogram import is wrapped to prevent startup crashes if requirements.txt is missing on remote
 try:
     from pyrogram import Client
     pyrogram_available = True
@@ -25,32 +25,22 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_CHAT_ID = os.environ["OWNER_CHAT_ID"]
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "changeme")
 DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", "changeme")
+
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# Global Pyrogram Client
 tg_client: Client = None
+
+# Global asynchronous task queue for FFMPEG to prevent Koyeb server overloads
 processing_queue = asyncio.Queue()
 queued_tasks_count = 0
-
-# [MEMORY + QUEUE] Limit to 1 video at a time
-MAX_CONCURRENT_TASKS = 1
-semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
-
-# [ADMIN SECURITY] Admin whitelist
-ADMIN_IDS: Set[str] = {OWNER_CHAT_ID}
-
-
-def is_admin(chat_id: str) -> bool:
-    """Check if user is admin (owner or whitelisted)"""
-    return str(chat_id) in ADMIN_IDS
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global tg_client
-    
     if pyrogram_available and API_ID and API_HASH and BOT_TOKEN:
         try:
             tg_client = Client(
@@ -61,19 +51,23 @@ async def lifespan(app: FastAPI):
                 in_memory=True
             )
             await tg_client.start()
-            print("✓ Pyrogram started (handles 50MB - 2GB files)")
+            print("Pyrogram Client successfully started!")
         except Exception as e:
-            print(f"✗ Pyrogram failed: {e}")
+            print(f"Error starting Pyrogram Client: {e}")
             tg_client = None
     else:
-        print("⚠ Pyrogram disabled (only <50MB files will work)")
-
+        if not pyrogram_available:
+            print("WARNING: Pyrogram module not found! Unlimited uploads disabled. Please ensure requirements.txt is fully updated.")
+        else:
+            print("API_ID or API_HASH not found. Pyrogram Client disabled.")
+            
+    # Start continuous background queue worker
     worker_task = asyncio.create_task(queue_worker())
-    print("✓ Queue worker started (1 video at a time)")
-    print(f"✓ Admin-only mode: Only {OWNER_CHAT_ID} can control bot")
-    
+    print("Background FFMPEG Queue Worker started!")
+        
     yield
     
+    # Cancel worker task on shutdown
     worker_task.cancel()
     try:
         await worker_task
@@ -83,15 +77,16 @@ async def lifespan(app: FastAPI):
     if tg_client:
         try:
             await tg_client.stop()
-        except:
-            pass
-
+            print("Pyrogram Client stopped.")
+        except Exception as e:
+            print(f"Error stopping Pyrogram Client: {e}")
 
 app = FastAPI(lifespan=lifespan)
 
 connected_devices: Dict[str, WebSocket] = {}
 progress_message_ids: Dict[str, int] = {}
 last_edit_time: Dict[str, float] = {}
+last_progress_edit: Dict[str, float] = {}
 last_edit_timestamps: Dict[str, float] = {}
 
 
@@ -101,6 +96,7 @@ def clean_chat_id(chat_id: str) -> Union[int, str]:
         return int(c)
     if c.isdigit():
         return int(c)
+    # [DEFENSIVE CODING] Auto-prepend @ if the user wrote a username without @ prefix
     if not c.startswith("@") and not c.startswith("-") and not c.isdigit():
         if any(char.isalpha() for char in c):
             return f"@{c}"
@@ -111,47 +107,56 @@ async def tg_send_message(chat_id: str, text: str, auto_delete: bool = False, de
     global tg_client
     msg_id = None
     target_clean = clean_chat_id(chat_id)
-
+    print(f"[TG_SEND] Sending message to {target_clean}: {text[:60]}...")
+    
     if pyrogram_available and tg_client and tg_client.is_connected:
         try:
             msg = await tg_client.send_message(chat_id=target_clean, text=text)
             msg_id = msg.id
+            print(f"[TG_SEND] Pyrogram message sent! ID: {msg_id}")
             if msg_id and auto_delete:
                 asyncio.create_task(schedule_message_deletion(chat_id, msg_id, delay))
             return msg_id
         except Exception as e:
-            print(f"[TG] Pyrogram failed: {e}")
-
+            print(f"[TG_SEND] Pyrogram send_message failed: {e}. Falling back to httpx.")
+            
     async with httpx.AsyncClient() as client:
         try:
             r = await client.post(f"{TELEGRAM_API}/sendMessage", data={"chat_id": chat_id, "text": text})
             data = r.json()
             if data.get("ok"):
                 msg_id = data["result"]["message_id"]
-        except:
-            pass
-
+                print(f"[TG_SEND] Fallback HTTP message sent! ID: {msg_id}")
+        except Exception as err:
+            print(f"[TG_SEND] Fallback HTTP send failed: {err}")
+                
     if msg_id and auto_delete:
         asyncio.create_task(schedule_message_deletion(chat_id, msg_id, delay))
+        
     return msg_id
 
 
 async def tg_delete_message(chat_id: str, message_id: int):
     global tg_client
     target_clean = clean_chat_id(chat_id)
+    print(f"[TG_DELETE] Deleting message {message_id} from {target_clean}")
     
     if pyrogram_available and tg_client and tg_client.is_connected:
         try:
             await tg_client.delete_messages(chat_id=target_clean, message_ids=message_id)
             return True
-        except:
-            pass
-    
+        except Exception as e:
+            print(f"[TG_DELETE] Pyrogram delete failed: {e}. Falling back to httpx.")
+            
     async with httpx.AsyncClient() as client:
         try:
-            await client.post(f"{TELEGRAM_API}/deleteMessage", data={"chat_id": chat_id, "message_id": message_id})
+            await client.post(
+                f"{TELEGRAM_API}/deleteMessage",
+                data={"chat_id": chat_id, "message_id": message_id},
+            )
             return True
-        except:
+        except Exception as err:
+            print(f"[TG_DELETE] Fallback HTTP delete failed: {err}")
             return False
 
 
@@ -171,12 +176,16 @@ async def tg_edit_message(chat_id: str, message_id: int, text: str):
         except Exception as e:
             if "MESSAGE_NOT_MODIFIED" in str(e):
                 return True
-    
+            print(f"[TG_EDIT] Pyrogram edit failed: {e}. Falling back to httpx.")
+            
     async with httpx.AsyncClient() as client:
         try:
-            await client.post(f"{TELEGRAM_API}/editMessageText", data={"chat_id": chat_id, "message_id": message_id, "text": text})
-        except:
-            pass
+            await client.post(
+                f"{TELEGRAM_API}/editMessageText",
+                data={"chat_id": chat_id, "message_id": message_id, "text": text},
+            )
+        except Exception as err:
+            print(f"[TG_EDIT] Fallback HTTP edit failed: {err}")
 
 
 def make_progress_bar(percent: float, length: int = 10) -> str:
@@ -191,134 +200,59 @@ async def edit_status_throttled(chat_id: str, message_id: int, text: str, force:
         last_edit_timestamps[key] = now
         try:
             await tg_edit_message(chat_id, message_id, text)
-        except:
+        except Exception:
             pass
 
 
-# ============================================================
-# [NEW] PHOTO UPLOAD HANDLER
-# ============================================================
-
-async def upload_photo_to_telegram(file_path: str, file_name: str, chat_id: str, target_chat: str, caption: str = ""):
-    """Upload photo to Telegram immediately (no conversion needed)"""
-    global tg_client
-    target_chat_clean = clean_chat_id(target_chat)
-    
-    status_msg_id = progress_message_ids.get(chat_id)
-    if not status_msg_id:
-        status_msg_id = await tg_send_message(chat_id, "📸 Photo uploading...")
-        if status_msg_id:
-            progress_message_ids[chat_id] = status_msg_id
-    
-    status_text = f"📸 **[ PHOTO DELIVERY ]** 📸\n━━━━━━━━━━━━━━━━━━━━━━\n📤 Uploading photo... ⏳\n━━━━━━━━━━━━━━━━━━━━━━"
-    await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
-    
-    sent = False
-    
-    # Try Pyrogram first
-    if pyrogram_available and tg_client and tg_client.is_connected:
-        try:
-            try:
-                await tg_client.get_chat(target_chat_clean)
-            except:
-                pass
-            
-            await tg_client.send_photo(
-                chat_id=target_chat_clean,
-                photo=file_path,
-                caption=caption
-            )
-            sent = True
-            print(f"[PHOTO] Sent via Pyrogram: {file_name}")
-        except Exception as e:
-            print(f"[PHOTO] Pyrogram failed: {e}")
-    
-    # Fallback to HTTP
-    if not sent:
-        try:
-            async with httpx.AsyncClient() as client:
-                with open(file_path, "rb") as f:
-                    files = {"photo": (file_name, f, "image/jpeg")}
-                    data = {"chat_id": target_chat, "caption": caption}
-                    r = await client.post(f"{TELEGRAM_API}/sendPhoto", data=data, files=files, timeout=60)
-                    if r.status_code == 200 and r.json().get("ok", False):
-                        sent = True
-                        print(f"[PHOTO] Sent via HTTP: {file_name}")
-        except Exception as e:
-            print(f"[PHOTO] HTTP failed: {e}")
-    
-    if sent:
-        done_text = f"📸 **[ PHOTO DELIVERED ]** 📸\n━━━━━━━━━━━━━━━━━━━━━━\n✅ Photo: {file_name}\n━━━━━━━━━━━━━━━━━━━━━━"
-    else:
-        done_text = f"📸 **[ PHOTO FAILED ]** 📸\n━━━━━━━━━━━━━━━━━━━━━━\n❌ Upload failed\n━━━━━━━━━━━━━━━━━━━━━━"
-    
-    await edit_status_throttled(chat_id, status_msg_id, done_text, force=True)
-    
-    # Cleanup
-    try:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-    except:
-        pass
-    
-    progress_message_ids.pop(chat_id, None)
-    last_edit_timestamps.pop(f"{chat_id}_{status_msg_id}", None)
-    gc.collect()
-    
-    return sent
-
-
-# ============================================================
-# VIDEO PROCESSING (Same as before)
-# ============================================================
-
 async def has_audio_track(file_path: str) -> bool:
-    cmd = ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
-    try:
-        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, _ = await process.communicate()
-        return len(stdout.strip()) > 0
-    except:
-        return False
-
-
-async def get_video_duration(file_path: str) -> float:
-    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
-    try:
-        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, _ = await process.communicate()
-        return float(stdout.strip())
-    except:
-        return 0.0
-
-
-async def convert_video_to_mp4(input_path: str, output_path: str, chat_id: str, message_id: int) -> bool:
-    total_duration = await get_video_duration(input_path)
-    if total_duration <= 0:
-        total_duration = 1.0
-    has_audio = await has_audio_track(input_path)
-
     cmd = [
-        "ffmpeg", "-y",
-        "-threads", "1",
-        "-i", input_path,
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "28",
-        "-pix_fmt", "yuv420p",
+        "ffprobe", "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=codec_type",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        file_path
     ]
-    
-    if has_audio:
-        cmd.extend(["-c:a", "aac", "-b:a", "96k"])
-    else:
-        cmd.append("-an")
-    
-    cmd.extend(["-movflags", "+faststart", output_path])
-
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        return len(stdout.strip()) > 0
+    except Exception:
+        return False
+
+
+async def convert_video_to_mp4_with_progress(input_path: str, output_path: str, chat_id: str, message_id: int) -> bool:
+    print(f"[FFMPEG] Starting conversion for {input_path}")
+    total_duration = await get_video_duration(input_path)
+    print(f"[FFMPEG] Video total duration: {total_duration}s")
+    if total_duration <= 0:
+        total_duration = 1.0 # Avoid division by zero
+        
+    has_audio = await has_audio_track(input_path)
+    print(f"[FFMPEG] Video has audio: {has_audio}")
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-c:v", "libx264",
+        "-preset", "superfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+    ]
+    if has_audio:
+        cmd.extend(["-c:a", "aac", "-strict", "-2", "-b:a", "128k"])
+    else:
+        cmd.append("-an")
+        
+    cmd.extend(["-movflags", "+faststart", output_path])
+    
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         
@@ -327,306 +261,355 @@ async def convert_video_to_mp4(input_path: str, output_path: str, chat_id: str, 
             if not line_bytes:
                 break
             line = line_bytes.decode(errors='ignore').strip()
+            
             match = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", line)
             if match:
-                current_time = int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+                hours = int(match.group(1))
+                minutes = int(match.group(2))
+                seconds = float(match.group(3))
+                current_time = hours * 3600 + minutes * 60 + seconds
+                
                 percent = min(100.0, (current_time / total_duration) * 100)
                 bar = make_progress_bar(percent)
-                status_text = f"📊 **[ HD CONVERT ]** 📊\n━━━━━━━━━━━━━━━━━━━━━━\n📹 Direct: Delivered ✅\n⚙️ Converting: [{bar}] {percent:.1f}%\n━━━━━━━━━━━━━━━━━━━━━━"
+                
+                status_text = (
+                    f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📥 Receiving: Complete ✅\n"
+                    f"⚙️ Converting Video: [{bar}] {percent:.1f}%\n"
+                    f"📤 Uploading: Pending ⏳\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━"
+                )
                 await edit_status_throttled(chat_id, message_id, status_text)
-        
+                
         await process.wait()
-        gc.collect()
-        
-        return process.returncode == 0
+        conversion_success = (process.returncode == 0)
+        print(f"[FFMPEG] Conversion complete! Return code: {process.returncode}")
+        return conversion_success
     except Exception as e:
-        print(f"[FFMPEG] Error: {e}")
+        print(f"[FFMPEG] Error during video conversion: {e}")
         return False
 
 
-async def split_video(file_path: str, segment_duration: float) -> list:
-    output_pattern = "/tmp/split_part_%03d.mp4"
-    for f in glob.glob("/tmp/split_part_*.mp4"):
+async def get_video_duration(file_path: str) -> float:
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        file_path
+    ]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        return float(stdout.strip())
+    except Exception as e:
+        print(f"[FFPROBE] Exception getting video duration: {e}")
+        return 0.0
+
+
+async def split_video(file_path: str, segment_duration: float) -> list[str]:
+    output_pattern = "/tmp/part_%03d.mp4"
+    for f in glob.glob("/tmp/part_*.mp4"):
         try:
             os.remove(f)
-        except:
+        except Exception:
             pass
-    
-    cmd = ["ffmpeg", "-y", "-threads", "1", "-i", file_path, "-c", "copy", "-map", "0", "-segment_time", str(segment_duration), "-f", "segment", "-reset_timestamps", "1", output_pattern]
-    
+            
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", file_path,
+        "-c", "copy",
+        "-map", "0",
+        "-segment_time", str(segment_duration),
+        "-f", "segment",
+        "-reset_timestamps", "1",
+        output_pattern
+    ]
     try:
-        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
         await process.communicate()
-        gc.collect()
-        
         if process.returncode == 0:
-            parts = sorted(glob.glob("/tmp/split_part_*.mp4"))
-            if parts:
-                return parts
+            return sorted(glob.glob("/tmp/part_*.mp4"))
         return [file_path]
-    except:
+    except Exception as e:
+        print(f"[FFMPEG] Video split exception: {e}")
         return [file_path]
 
 
-async def generate_thumbnail(video_path: str, thumb_path: str) -> bool:
-    cmd = ["ffmpeg", "-y", "-threads", "1", "-ss", "00:00:02", "-i", video_path, "-vframes", "1", "-q:v", "5", thumb_path]
-    try:
-        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        await process.wait()
-        return process.returncode == 0
-    except:
-        return False
-
-
-async def progress_callback(current, total, chat_id, message_id, filename, current_part, total_parts, label="Uploading"):
+async def pyrogram_progress_callback(current, total, chat_id, message_id, filename, current_part, total_parts):
     percent = (current / total) * 100
     bar = make_progress_bar(percent)
     current_mb = current / (1024 * 1024)
     total_mb = total / (1024 * 1024)
     
     if total_parts > 1:
-        upload_line = f"📤 {label} Part {current_part}/{total_parts}: [{bar}] {percent:.1f}%\nℹ️ {current_mb:.1f}MB / {total_mb:.1f}MB"
+        upload_line = f"📤 Uploading Part {current_part}/{total_parts}: [{bar}] {percent:.1f}%\nℹ️ Speed: {current_mb:.1f}MB / {total_mb:.1f}MB"
     else:
-        upload_line = f"📤 {label}: [{bar}] {percent:.1f}%\nℹ️ {current_mb:.1f}MB / {total_mb:.1f}MB"
+        upload_line = f"📤 Uploading Video: [{bar}] {percent:.1f}%\nℹ️ Speed: {current_mb:.1f}MB / {total_mb:.1f}MB"
+        
+    status_text = (
+        f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📥 Receiving: Complete ✅\n"
+        f"⚙️ Converting: Complete ✅\n"
+    )
     
-    status_text = f"📊 **[ STATUS ]** 📊\n━━━━━━━━━━━━━━━━━━━━━━\n{upload_line}\n━━━━━━━━━━━━━━━━━━━━━━"
+    if total_parts > 1:
+        status_text += f"✂️ Splitting: {total_parts} Parts Created ✅\n"
+        
+    status_text += (
+        f"{upload_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    
     await edit_status_throttled(chat_id, message_id, status_text, force=(current == total))
 
 
-async def safe_send_video(target_chat_clean, video_path, caption, thumb_path, progress_args_tuple, chat_id, status_msg_id, label):
+async def process_and_upload_video(input_path: str, file_name: str, chat_id: str, target_chat: str, caption: str = ""):
     global tg_client
-    if not (pyrogram_available and tg_client and tg_client.is_connected):
-        return False
-    
-    try:
-        try:
-            await tg_client.get_chat(target_chat_clean)
-        except:
-            pass
-
-        kwargs = {
-            "chat_id": target_chat_clean,
-            "video": video_path,
-            "caption": caption,
-            "supports_streaming": True,
-            "progress": progress_callback,
-            "progress_args": progress_args_tuple
-        }
-        if thumb_path and os.path.exists(thumb_path):
-            kwargs["thumb"] = thumb_path
-
-        await tg_client.send_video(**kwargs)
-        gc.collect()
-        
-        return True
-    except Exception as e:
-        print(f"[SEND] Error: {e}")
-        return False
-
-
-async def safe_send_video_http(target_chat, video_path, caption, thumb_path, file_name):
-    file_size = os.path.getsize(video_path)
-    if file_size > 50 * 1024 * 1024:
-        print(f"[SEND] File too large for HTTP ({file_size / (1024*1024):.1f}MB), using Pyrogram")
-        return False
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            with open(video_path, "rb") as f:
-                files = {"video": (file_name, f, "video/mp4")}
-                if thumb_path and os.path.exists(thumb_path):
-                    with open(thumb_path, "rb") as t:
-                        files["thumb"] = (os.path.basename(thumb_path), t, "image/jpeg")
-                data = {"chat_id": target_chat, "caption": caption, "supports_streaming": "true"}
-                r = await client.post(f"{TELEGRAM_API}/sendVideo", data=data, files=files, timeout=None)
-                gc.collect()
-                
-                return r.status_code == 200 and r.json().get("ok", False)
-    except:
-        return False
-
-
-async def send_original_fast(input_path, file_name, chat_id, target_chat, caption, status_msg_id, queue_position):
     target_chat_clean = clean_chat_id(target_chat)
-    file_size = os.path.getsize(input_path)
-    limit_2gb = 2000 * 1024 * 1024
-
-    base, _ = os.path.splitext(file_name)
-    thumb_path = f"/tmp/{base}_orig_thumb.jpg"
-    has_thumb = await generate_thumbnail(input_path, thumb_path)
-    if not has_thumb or not os.path.exists(thumb_path) or os.path.getsize(thumb_path) == 0:
-        thumb_path = None
-
-    if queue_position > 1:
-        status_text = f"📊 **[ QUEUE ]** 📊\n━━━━━━━━━━━━━━━━━━━━━━\n⏳ Position: #{queue_position}\n📥 Received: Complete ✅\n📤 Waiting for turn...\n━━━━━━━━━━━━━━━━━━━━━━"
-        await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
-        await semaphore.acquire()
-        semaphore.release()
+    status_chat_clean = clean_chat_id(chat_id)
+    print(f"[PIPELINE] Starting process_and_upload_video. Status Chat: {status_chat_clean}, Video Target Chat: {target_chat_clean}, file: {file_name}")
     
-    status_text = f"📊 **[ FAST DELIVERY ]** 📊\n━━━━━━━━━━━━━━━━━━━━━━\n📥 Received: Complete ✅\n📤 Sending Direct Video... ⏳\n━━━━━━━━━━━━━━━━━━━━━━"
+    # Try to reuse the existing progress message if it exists (which is in OWNER_CHAT_ID / status_chat_clean)
+    status_msg_id = progress_message_ids.get(chat_id)
+    if not status_msg_id:
+        status_msg_id = await tg_send_message(chat_id, "⚙️ Processing: Video process ho raha hai...")
+        if status_msg_id:
+            progress_message_ids[chat_id] = status_msg_id
+            
+    # Initial status update for converting
+    status_text = (
+        f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📥 Receiving: Complete ✅\n"
+        f"⚙️ Converting Video: Starting... ⏳\n"
+        f"📤 Uploading: Pending ⏳\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━"
+    )
     await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
-
-    sent = False
-
-    if file_size > limit_2gb:
-        status_text = f"📊 **[ FAST DELIVERY ]** 📊\n━━━━━━━━━━━━━━━━━━━━━━\n📥 Received: Complete ✅\n✂️ Splitting {file_size / (1024*1024*1024):.1f}GB File... ⏳\n━━━━━━━━━━━━━━━━━━━━━━"
-        await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
-
-        duration = await get_video_duration(input_path)
-        if duration <= 0:
-            duration = 600.0
-        num_parts = math.ceil(file_size / limit_2gb)
-        segment_duration = duration / num_parts
-        parts = await split_video(input_path, segment_duration)
-
-        for i, part in enumerate(parts):
-            part_name = os.path.basename(part)
-            part_caption = f"{caption}\n\n🎬 Direct Part {i+1}/{len(parts)}"
-            ok = await safe_send_video(target_chat_clean, part, part_caption, thumb_path, (chat_id, status_msg_id, part_name, i+1, len(parts), "Direct Video"), chat_id, status_msg_id, "Direct Video")
-            if not ok:
-                ok = await safe_send_video_http(target_chat, part, part_caption, thumb_path, part_name)
-            if ok:
-                sent = True
-            if part != input_path:
-                try:
-                    os.remove(part)
-                except:
-                    pass
-    else:
-        direct_caption = f"{caption}\n\n📹 Direct Video (Original)"
-        ok = await safe_send_video(target_chat_clean, input_path, direct_caption, thumb_path, (chat_id, status_msg_id, file_name, 1, 1, "Direct Video"), chat_id, status_msg_id, "Direct Video")
-        if not ok:
-            ok = await safe_send_video_http(target_chat, input_path, direct_caption, thumb_path, file_name)
-        if ok:
-            sent = True
-
-    if thumb_path and os.path.exists(thumb_path):
-        try:
-            os.remove(thumb_path)
-        except:
-            pass
-
-    return sent
-
-
-async def background_convert_and_send(input_path, file_name, chat_id, target_chat, caption, status_msg_id):
-    target_chat_clean = clean_chat_id(target_chat)
+    
     base, _ = os.path.splitext(file_name)
-    output_name = f"{base}_HD.mp4"
+    output_name = f"{base}_converted.mp4"
     temp_output_path = f"/tmp/{output_name}"
-
+    
     if os.path.exists(temp_output_path):
         try:
             os.remove(temp_output_path)
-        except:
+        except Exception:
             pass
-
-    status_text = f"📊 **[ HD CONVERT ]** 📊\n━━━━━━━━━━━━━━━━━━━━━━\n📹 Direct: Delivered ✅\n⚙️ Converting: Starting... ⏳\n━━━━━━━━━━━━━━━━━━━━━━"
-    await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
-
-    success = await convert_video_to_mp4(input_path, temp_output_path, chat_id, status_msg_id)
-
+            
+    # Convert video with active real-time progress parsing
+    success = await convert_video_to_mp4_with_progress(input_path, temp_output_path, chat_id, status_msg_id)
+    
+    # [ROBUST FALLBACK] If conversion fails (e.g. FFMPEG not installed on Koyeb yet), upload the ORIGINAL raw video!
+    upload_path = temp_output_path
+    upload_name = output_name
+    conversion_failed = False
+    
     if not success or not os.path.exists(temp_output_path) or os.path.getsize(temp_output_path) == 0:
-        status_text = f"📊 **[ COMPLETE ]** 📊\n━━━━━━━━━━━━━━━━━━━━━━\n📹 Direct: Delivered ✅\n⚙️ HD: Not needed ℹ️\n━━━━━━━━━━━━━━━━━━━━━━\n✅ Done!"
+        conversion_failed = True
+        upload_path = input_path
+        upload_name = file_name
+        print("[PIPELINE] FFMPEG conversion failed or output is missing! Falling back to raw original video.")
+        
+        status_text = (
+            f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📥 Receiving: Complete ✅\n"
+            f"⚠️ Converting: Failed (Uploading raw video instead) ⚠️\n"
+            f"📤 Uploading: Starting... ⏳\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━"
+        )
         await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
+    else:
+        print("[PIPELINE] FFMPEG conversion succeeded!")
         try:
-            os.remove(temp_output_path)
-        except:
+            os.remove(input_path)
+        except Exception:
             pass
-        return
-
-    converted_size = os.path.getsize(temp_output_path)
-    limit_2gb = 2000 * 1024 * 1024
-
-    thumb_path = f"/tmp/{base}_hd_thumb.jpg"
-    has_thumb = await generate_thumbnail(temp_output_path, thumb_path)
-    if not has_thumb or not os.path.exists(thumb_path) or os.path.getsize(thumb_path) == 0:
-        thumb_path = None
-
-    status_text = f"📊 **[ HD CONVERT ]** 📊\n━━━━━━━━━━━━━━━━━━━━━━\n📹 Direct: Delivered ✅\n⚙️ Converting: Complete ✅\n📤 Uploading HD... ⏳\n━━━━━━━━━━━━━━━━━━━━━━"
-    await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
-
-    sent = False
-
-    if converted_size > limit_2gb:
-        duration = await get_video_duration(temp_output_path)
-        if duration <= 0:
-            duration = 600.0
-        num_parts = math.ceil(converted_size / limit_2gb)
-        segment_duration = duration / num_parts
-        parts = await split_video(temp_output_path, segment_duration)
-
-        for i, part in enumerate(parts):
-            part_name = os.path.basename(part)
-            part_caption = f"{caption}\n\n🎬 HD Part {i+1}/{len(parts)}"
-            ok = await safe_send_video(target_chat_clean, part, part_caption, thumb_path, (chat_id, status_msg_id, part_name, i+1, len(parts), "HD Video"), chat_id, status_msg_id, "HD Video")
-            if not ok:
-                ok = await safe_send_video_http(target_chat, part, part_caption, thumb_path, part_name)
-            if ok:
-                sent = True
-            if part != temp_output_path:
-                try:
-                    os.remove(part)
-                except:
-                    pass
-    else:
-        hd_caption = f"{caption}\n\n🎬 HD Converted Video"
-        ok = await safe_send_video(target_chat_clean, temp_output_path, hd_caption, thumb_path, (chat_id, status_msg_id, output_name, 1, 1, "HD Video"), chat_id, status_msg_id, "HD Video")
-        if not ok:
-            ok = await safe_send_video_http(target_chat, temp_output_path, hd_caption, thumb_path, output_name)
-        if ok:
-            sent = True
-
-    if sent:
-        done_text = f"📊 **[ COMPLETE ]** 📊\n━━━━━━━━━━━━━━━━━━━━━━\n📹 Direct: Delivered ✅\n🎬 HD: Delivered ✅\n━━━━━━━━━━━━━━━━━━━━━━\n🎉 Done!"
-    else:
-        done_text = f"📊 **[ COMPLETE ]** 📊\n━━━━━━━━━━━━━━━━━━━━━━\n📹 Direct: Delivered ✅\n🎬 HD: Skipped ℹ️\n━━━━━━━━━━━━━━━━━━━━━━\n✅ Done!"
+        
+    converted_size = os.path.getsize(upload_path)
+    limit_2gb = 2000 * 1024 * 1024 # 2000 MB
+    print(f"[PIPELINE] Final file size to upload: {converted_size / (1024*1024):.1f}MB")
     
-    await edit_status_throttled(chat_id, status_msg_id, done_text, force=True)
-
-    for path in [temp_output_path, thumb_path]:
+    # Converting is complete / skipped
+    if not conversion_failed:
+        status_text = (
+            f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📥 Receiving: Complete ✅\n"
+            f"⚙️ Converting: Complete ✅\n"
+            f"📤 Uploading: Starting... ⏳\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
+    
+    if pyrogram_available and tg_client and tg_client.is_connected:
         try:
-            if path and os.path.exists(path):
+            print(f"[PIPELINE] Attempting upload via Pyrogram client to target chat {target_chat_clean}")
+            if converted_size > limit_2gb:
+                print("[PIPELINE] File size is over 2GB. Initiating split-video routine...")
+                status_text = (
+                    f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📥 Receiving: Complete ✅\n"
+                    f"⚙️ Converting: {'Complete ✅' if not conversion_failed else 'Failed ⚠️'}\n"
+                    f"✂️ Splitting: 2GB+ File detected. Splitting video... ⏳\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━"
+                )
+                await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
+                
+                duration = await get_video_duration(upload_path)
+                if duration <= 0:
+                    duration = 600.0
+                    
+                num_parts = math.ceil(converted_size / limit_2gb)
+                segment_duration = duration / num_parts
+                
+                parts = await split_video(upload_path, segment_duration)
+                if len(parts) > 1:
+                    status_text = (
+                        f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📥 Receiving: Complete ✅\n"
+                        f"⚙️ Converting: {'Complete ✅' if not conversion_failed else 'Failed ⚠️'}\n"
+                        f"✂️ Splitting: {len(parts)} Parts Created ✅\n"
+                        f"📤 Uploading: Starting upload... ⏳\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━"
+                    )
+                    await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
+                    
+                    for i, part in enumerate(parts):
+                        part_name = os.path.basename(part)
+                        part_caption = f"{caption}\n\n🎬 Part {i+1} of {len(parts)}"
+                        print(f"[PIPELINE] Uploading split part {i+1}/{len(parts)}: {part_name}")
+                        
+                        await tg_client.send_video(
+                            chat_id=target_chat_clean,
+                            video=part,
+                            caption=part_caption,
+                            supports_streaming=True, # [STREAMING FIX] Tells Telegram to enable in-app streaming
+                            progress=pyrogram_progress_callback,
+                            progress_args=(chat_id, status_msg_id, part_name, i+1, len(parts))
+                        )
+                else:
+                    await tg_client.send_video(
+                        chat_id=target_chat_clean,
+                        video=upload_path,
+                        caption=caption,
+                        supports_streaming=True, # [STREAMING FIX] Tells Telegram to enable in-app streaming
+                        progress=pyrogram_progress_callback,
+                        progress_args=(chat_id, status_msg_id, upload_name, 1, 1)
+                    )
+            else:
+                print(f"[PIPELINE] Uploading single video file: {upload_name}")
+                await tg_client.send_video(
+                    chat_id=target_chat_clean,
+                    video=upload_path,
+                    caption=caption,
+                    supports_streaming=True, # [STREAMING FIX] Tells Telegram to enable in-app streaming
+                    progress=pyrogram_progress_callback,
+                    progress_args=(chat_id, status_msg_id, upload_name, 1, 1)
+                )
+                
+            done_text = (
+                f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📥 Receiving: Complete ✅\n"
+                f"⚙️ Converting: {'Complete ✅' if not conversion_failed else 'Failed (Uploaded Raw) ⚠️'}\n"
+                f"📤 Uploading: Complete ✅\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🎉 **Done! Video convert aur upload ho gaya!**"
+            )
+            await edit_status_throttled(chat_id, status_msg_id, done_text, force=True)
+            print("[PIPELINE] Video successfully uploaded to Telegram using Pyrogram!")
+            
+        except Exception as e:
+            print(f"[PIPELINE] Pyrogram Upload Error encountered: {e}")
+            await tg_send_message(chat_id, f"❌ Pyrogram Upload Error: {str(e)}")
+    else:
+        print("[PIPELINE] Pyrogram Client not available or not connected! Falling back to standard HTTP Bot API.")
+        if converted_size > 50 * 1024 * 1024:
+            warn_text = (
+                f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📥 Receiving: Complete ✅\n"
+                f"⚙️ Converting: {'Complete ✅' if not conversion_failed else 'Failed ⚠️'}\n"
+                f"⚠️ Uploading: Skipped (File is {converted_size / (1024*1024):.1f}MB)\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Telegram Bot API standard upload limit 50MB hai. Unlimited uploads aur splitting ke liye Koyeb me API_ID aur API_HASH environment variables set karein, aur requirements.txt me pyrogram add karein!"
+            )
+            await edit_status_throttled(chat_id, status_msg_id, warn_text, force=True)
+        else:
+            status_text = (
+                f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📥 Receiving: Complete ✅\n"
+                f"⚙️ Converting: {'Complete ✅' if not conversion_failed else 'Failed ⚠️'}\n"
+                f"📤 Uploading: Via standard Bot API... ⏳\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━"
+            )
+            await edit_status_throttled(chat_id, status_msg_id, status_text, force=True)
+            try:
+                async with httpx.AsyncClient() as client:
+                    with open(upload_path, "rb") as f:
+                        files = {"video": (upload_name, f, "video/mp4")}
+                        data = {
+                            "chat_id": target_chat, # The final video destination!
+                            "caption": caption,
+                            "supports_streaming": "true" # [STREAMING FIX] Tells Telegram Bot API to support streaming
+                        }
+                        r = await client.post(f"{TELEGRAM_API}/sendVideo", data=data, files=files, timeout=None)
+                        if r.status_code == 200 and r.json().get("ok"):
+                            done_text = (
+                                f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"📥 Receiving: Complete ✅\n"
+                                f"⚙️ Converting: {'Complete ✅' if not conversion_failed else 'Failed (Uploaded Raw) ⚠️'}\n"
+                                f"📤 Uploading: Complete ✅\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"🎉 **Done! Video standard Bot API se upload ho gaya!**"
+                            )
+                            await edit_status_throttled(chat_id, status_msg_id, done_text, force=True)
+                            print("[PIPELINE] Video successfully uploaded to Telegram using fallback HTTP Bot API!")
+                        else:
+                            print(f"[PIPELINE] Fallback HTTP Bot API send failed! Status: {r.status_code}, Body: {r.text}")
+                            await tg_send_message(chat_id, f"❌ Bot API upload failed: {r.text}")
+            except Exception as e:
+                print(f"[PIPELINE] Standard Bot API Upload exception: {e}")
+                await tg_send_message(chat_id, f"❌ Standard Bot API Upload Error: {str(e)}")
+                
+    # Clean up all temp files
+    for path in [input_path, temp_output_path]:
+        try:
+            if os.path.exists(path):
                 os.remove(path)
-        except:
+        except Exception:
             pass
-    
-    for f in glob.glob("/tmp/split_part_*.mp4"):
+            
+    for f in glob.glob("/tmp/part_*.mp4"):
         try:
             os.remove(f)
-        except:
+        except Exception:
             pass
+            
+    # Comprehensive clean up of progress states for this run
+    progress_message_ids.pop(chat_id, None)
+    last_progress_edit.pop(f"{chat_id}_{status_msg_id}", None)
+    last_edit_timestamps.pop(f"{chat_id}_{status_msg_id}", None)
+    
+    return True
 
-
-async def process_and_upload_video(input_path, file_name, chat_id, target_chat, caption="", queue_position=1):
-    async with semaphore:
-        status_msg_id = progress_message_ids.get(chat_id)
-        if not status_msg_id:
-            status_msg_id = await tg_send_message(chat_id, "⚙️ Processing...")
-            if status_msg_id:
-                progress_message_ids[chat_id] = status_msg_id
-
-        await send_original_fast(input_path, file_name, chat_id, target_chat, caption, status_msg_id, queue_position)
-        await background_convert_and_send(input_path, file_name, chat_id, target_chat, caption, status_msg_id)
-
-        try:
-            if os.path.exists(input_path):
-                os.remove(input_path)
-        except:
-            pass
-
-        for f in glob.glob("/tmp/split_part_*.mp4"):
-            try:
-                os.remove(f)
-            except:
-                pass
-
-        progress_message_ids.pop(chat_id, None)
-        last_edit_timestamps.pop(f"{chat_id}_{status_msg_id}", None)
-        gc.collect()
-        
-        print(f"[PIPELINE] Video #{queue_position} done + GC")
-
+# --- Async Background Task Queue Worker ---
 
 async def queue_worker():
     global queued_tasks_count
@@ -634,68 +617,54 @@ async def queue_worker():
         try:
             item = await processing_queue.get()
             queued_tasks_count = max(0, queued_tasks_count - 1)
-            queue_position = item.get("queue_position", 1)
             
-            # [NEW] Check if it's a photo or video
-            if item.get("type") == "photo":
-                await upload_photo_to_telegram(item["input_path"], item["file_name"], item["chat_id"], item["target_chat"], item["caption"])
-            else:
-                await process_and_upload_video(item["input_path"], item["file_name"], item["chat_id"], item["target_chat"], item["caption"], queue_position)
+            input_path = item["input_path"]
+            file_name = item["file_name"]
+            chat_id = item["chat_id"]         # Progress/Status Chat (Always OWNER_CHAT_ID)
+            target_chat = item["target_chat"] # Video Destination Chat (Can be Channel ID or Owner ID)
+            caption = item["caption"]
             
+            try:
+                await process_and_upload_video(input_path, file_name, chat_id, target_chat, caption)
+            except Exception as e:
+                print(f"Error in queue worker processing: {e}")
+                
             processing_queue.task_done()
         except asyncio.CancelledError:
             break
         except Exception as e:
-            print(f"Queue error: {e}")
+            print(f"Error in queue worker loop: {e}")
             await asyncio.sleep(1)
 
+
+# --- Custom Webhook ---
 
 @app.post("/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
         return {"ok": False}
+
     update = await request.json()
     message = update.get("message")
     if not message:
         return {"ok": True}
-    
+
     chat_id = str(message["chat"]["id"])
     text = message.get("text", "").strip()
     msg_id = message.get("message_id")
-    
-    # [ADMIN SECURITY] Check if user is admin
-    if not is_admin(chat_id):
-        await tg_send_message(
-            chat_id,
-            "🚫 **Access Denied**\n\nYou are not authorized to use this bot.\nOnly the owner can control this security camera.",
-            auto_delete=True,
-            delay=10
-        )
-        print(f"[SECURITY] Blocked non-admin user: {chat_id}")
-        return {"ok": True}
-    
+
+    # [AUTO DELETE USER COMMANDS]
+    # Delete the user's incoming command (like /status, /on, /off, /cam) after 5 seconds to keep DM clean
     if text.startswith("/") and msg_id:
         asyncio.create_task(schedule_message_deletion(chat_id, msg_id, 5))
-    
+
     if text == "/myid":
-        await tg_send_message(chat_id, f"✅ Your Chat ID: {chat_id}\n\nYou are ADMIN ✓", auto_delete=True, delay=10)
+        await tg_send_message(chat_id, f"Tumhara chat ID: {chat_id}", auto_delete=True, delay=5)
         return {"ok": True}
-    
-    if text == "/help":
-        help_text = (
-            "🔒 **Security Cam Bot - Admin Commands**\n\n"
-            "/on - Start recording\n"
-            "/off - Stop recording\n"
-            "/switch - Switch camera (front/back)\n"
-            "/photo - Take a photo 📸\n"  # [NEW]
-            "/status - Check phone connection\n"
-            "/myid - Show your chat ID\n"
-            "/help - Show this help\n\n"
-            "✅ You are authorized admin"
-        )
-        await tg_send_message(chat_id, help_text, auto_delete=True, delay=30)
+
+    if chat_id != OWNER_CHAT_ID:
         return {"ok": True}
-    
+
     cmd = text.lower()
     if cmd in ("/on", "/startcam", "/start_rec"):
         await dispatch_command(chat_id, "start")
@@ -703,31 +672,32 @@ async def telegram_webhook(secret: str, request: Request):
         await dispatch_command(chat_id, "stop")
     elif cmd in ("/switchcam", "/switch", "/cam"):
         await dispatch_command(chat_id, "switch")
-    elif cmd == "/photo":  # [NEW] Photo command
-        await dispatch_command(chat_id, "photo")
     elif cmd == "/status":
-        online = "Phone connected" if connected_devices else "Phone offline"
+        online = "Phone connected, ready" if connected_devices else "Phone offline (app band hai ya net nahi hai)"
+        # Status response will auto-delete in 5 seconds to keep chat clean
         await tg_send_message(chat_id, online, auto_delete=True, delay=5)
-    
+
     return {"ok": True}
 
 
 async def dispatch_command(chat_id: str, cmd: str):
     if not connected_devices:
-        await tg_send_message(chat_id, "Phone offline", auto_delete=True, delay=5)
+        await tg_send_message(chat_id, "Phone abhi offline hai, app khula hai ya nahi check karo", auto_delete=True, delay=5)
         return
     for ws in list(connected_devices.values()):
         try:
             await ws.send_json({"cmd": cmd, "chat_id": chat_id})
-        except:
+        except Exception:
             pass
-    labels = {
-        "start": "Recording ON",
-        "stop": "Recording OFF",
-        "switch": "Camera switch",
-        "photo": "📸 Taking photo..."  # [NEW]
-    }
-    await tg_send_message(chat_id, f"Command: {labels.get(cmd, cmd)}", auto_delete=True, delay=5)
+    if cmd == "start":
+        label = "Command bheja: recording ON"
+    elif cmd == "stop":
+        label = "Command bheja: recording OFF"
+    else:
+        label = "Command bheja: camera switch"
+        
+    # Command confirmation messages will auto-delete in 5 seconds to keep chat clean
+    await tg_send_message(chat_id, label, auto_delete=True, delay=5)
 
 
 @app.websocket("/ws")
@@ -736,28 +706,36 @@ async def ws_endpoint(websocket: WebSocket):
     if token != DEVICE_TOKEN:
         await websocket.close(code=4401)
         return
+
     await websocket.accept()
     connected_devices[token] = websocket
     try:
         while True:
             message = await websocket.receive()
-            if message.get("type") == "websocket.disconnect":
+            msg_type = message.get("type")
+            
+            if msg_type == "websocket.disconnect":
                 break
+                
             if "text" in message:
                 try:
                     data = json.loads(message["text"])
                     await handle_device_event(data)
-                except:
-                    pass
-    except:
-        pass
+                except Exception as e:
+                    print(f"Error parsing websocket JSON: {e}")
+            elif "bytes" in message:
+                print("Received binary data over WebSocket (ignored)")
+    except Exception as e:
+        print(f"WebSocket exception: {e}")
     finally:
         connected_devices.pop(token, None)
 
 
 async def handle_device_event(data: dict):
+    # Always redirect the phone's status/progress updates to the OWNER'S PERSONAL CHAT!
     chat_id = OWNER_CHAT_ID
     event = data.get("event")
+
     if event == "status":
         text = data.get("text", "")
         mid = progress_message_ids.get(chat_id)
@@ -767,14 +745,25 @@ async def handle_device_event(data: dict):
             mid = await tg_send_message(chat_id, text)
             if mid:
                 progress_message_ids[chat_id] = mid
+
     elif event == "progress":
         percent = int(data.get("percent", 0))
         bar = make_progress_bar(percent)
-        text = f"📊 **[ UPLOAD ]** 📊\n━━━━━━━━━━━━━━━━━━━━━━\n📥 Phone → Server: [{bar}] {percent}%\n━━━━━━━━━━━━━━━━━━━━━━"
+        
+        text = (
+            f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📥 Receiving from Phone: [{bar}] {percent}%\n"
+            f"⚙️ Converting: Pending ⏳\n"
+            f"📤 Uploading: Pending ⏳\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━"
+        )
+
         now = time.time()
         if now - last_edit_time.get(chat_id, 0) < 2 and percent < 100:
             return
         last_edit_time[chat_id] = now
+
         mid = progress_message_ids.get(chat_id)
         if mid:
             await tg_edit_message(chat_id, mid, text)
@@ -783,115 +772,179 @@ async def handle_device_event(data: dict):
             if mid:
                 progress_message_ids[chat_id] = mid
 
+    elif event == "done":
+        # Keep the progress_message_ids saved so process_and_upload_video can reuse it!
+        # It will be popped when the upload/process pipeline completely finishes.
+        pass
+
+
+# --- Custom Upload & Telegram Bot API Proxy Endpoints ---
 
 @app.post("/upload")
 async def custom_upload(
     request: Request,
     chat_id: str = Form(None),
     caption: str = Form(""),
-    file_type: str = Form("video")  # [NEW] Support photo upload
 ):
     global queued_tasks_count
     form_data = await request.form()
+    
+    # [ROBUST FILE EXTRACTION]
     file_field = None
     for key, value in form_data.multi_items():
         if hasattr(value, "filename") and value.filename:
             file_field = value
             break
+            
     if not file_field:
-        return {"ok": False}
-    
+        return {"ok": False, "description": "No file uploaded"}
+        
     target_chat = chat_id or OWNER_CHAT_ID
-    file_name = file_field.filename or ("photo.jpg" if file_type == "photo" else "video.mp4")
+    file_name = file_field.filename or "video.mp4"
     temp_input_path = f"/tmp/{file_name}"
     
     with open(temp_input_path, "wb") as buffer:
         shutil.copyfileobj(file_field.file, buffer)
-    
-    queued_tasks_count += 1
-    queue_position = queued_tasks_count
-    
+        
+    # We ALWAYS send status and progress messages to OWNER_CHAT_ID!
     status_msg_id = progress_message_ids.get(OWNER_CHAT_ID)
     if not status_msg_id:
-        emoji = "📸" if file_type == "photo" else "⚙️"
-        status_msg_id = await tg_send_message(OWNER_CHAT_ID, f"{emoji} Queued #{queue_position}...")
+        status_msg_id = await tg_send_message(OWNER_CHAT_ID, "⚙️ Processing: Video server par aa gaya hai...")
         if status_msg_id:
             progress_message_ids[OWNER_CHAT_ID] = status_msg_id
+            
+    if queued_tasks_count > 0:
+        status_text = (
+            f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📥 Receiving: Complete ✅\n"
+            f"⏳ Queue Position: #{queued_tasks_count} (Server busy hai, line me laga diya gaya hai...)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        await edit_status_throttled(OWNER_CHAT_ID, status_msg_id, status_text, force=True)
+        
+    queued_tasks_count += 1
     
-    await processing_queue.put({
+    item = {
         "input_path": temp_input_path,
         "file_name": file_name,
-        "chat_id": OWNER_CHAT_ID,
-        "target_chat": target_chat,
-        "caption": caption,
-        "queue_position": queue_position,
-        "type": file_type  # [NEW] "photo" or "video"
-    })
-    
-    return {"ok": True, "queue_position": queue_position}
+        "chat_id": OWNER_CHAT_ID,      # Status updates go to Owner's Chat
+        "target_chat": target_chat,    # Final video goes to requested chat (Channel)
+        "caption": caption
+    }
+    await processing_queue.put(item)
+    return {"ok": True, "description": "Processing queued successfully"}
 
 
 @app.post("/bot{token}/{method}")
-async def telegram_api_proxy(token: str, method: str, request: Request):
+async def telegram_api_proxy(
+    token: str,
+    method: str,
+    request: Request
+):
     global queued_tasks_count
     if token != BOT_TOKEN:
-        return {"ok": False}
+        return {"ok": False, "description": "Unauthorized token"}
+        
     if method not in ("sendVideo", "sendDocument", "sendAudio"):
+        # Proxy straight to Telegram Bot API
         async with httpx.AsyncClient() as client:
             headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
             body = await request.body()
-            r = await client.post(f"https://api.telegram.org/bot{token}/{method}", headers=headers, content=body, params=dict(request.query_params))
+            r = await client.post(
+                f"https://api.telegram.org/bot{token}/{method}",
+                headers=headers,
+                content=body,
+                params=dict(request.query_params)
+            )
             try:
                 return r.json()
-            except:
+            except Exception:
                 return r.text
+                
+    # Parse form data for media upload methods
     try:
         form_data = await request.form()
     except ClientDisconnect:
-        return {"ok": False}
+        return {"ok": False, "description": "Client disconnected before upload finished"}
+        
     chat_id = form_data.get("chat_id") or OWNER_CHAT_ID
     caption = form_data.get("caption") or ""
+    
+    # [ROBUST FILE EXTRACTION WITH MULTI_ITEMS AND DUCK-TYPING]
     file_field = None
     for key, value in form_data.multi_items():
         if hasattr(value, "filename") and value.filename:
             file_field = value
             break
+            
     if not file_field:
+        # Fallback to direct proxy if no actual file is present
+        # Since we already called request.form(), we cannot read request.body() anymore.
+        # Instead, we pass the parsed form_data dictionary directly to HTTPX!
         async with httpx.AsyncClient() as client:
             headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length", "content-type")}
-            r = await client.post(f"https://api.telegram.org/bot{token}/{method}", headers=headers, data=dict(form_data), params=dict(request.query_params))
+            r = await client.post(
+                f"https://api.telegram.org/bot{token}/{method}",
+                headers=headers,
+                data=dict(form_data),
+                params=dict(request.query_params)
+            )
             try:
                 return r.json()
-            except:
+            except Exception:
                 return r.text
-    
+                
+    # File is present, intercept and put in task Queue
     file_name = file_field.filename or "video.mp4"
     temp_input_path = f"/tmp/{file_name}"
+    
     with open(temp_input_path, "wb") as buffer:
         shutil.copyfileobj(file_field.file, buffer)
-    
-    queued_tasks_count += 1
-    queue_position = queued_tasks_count
-    
+        
+    # [SEPARATION FIX] We ALWAYS send status and progress messages to OWNER_CHAT_ID (the private Bot DM)!
+    # But the video file goes to 'chat_id' (which contains the Channel ID!)
     status_msg_id = progress_message_ids.get(OWNER_CHAT_ID)
     if not status_msg_id:
-        status_msg_id = await tg_send_message(OWNER_CHAT_ID, f"⚙️ Queued #{queue_position}...")
+        status_msg_id = await tg_send_message(OWNER_CHAT_ID, "⚙️ Processing: Video server par aa gaya hai...")
         if status_msg_id:
             progress_message_ids[OWNER_CHAT_ID] = status_msg_id
+            
+    if queued_tasks_count > 0:
+        status_text = (
+            f"📊 **[ CAMLITE PROCESS STATUS ]** 📊\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📥 Receiving: Complete ✅\n"
+            f"⏳ Queue Position: #{queued_tasks_count} (Server busy hai, line me laga diya gaya hai...)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        await edit_status_throttled(OWNER_CHAT_ID, status_msg_id, status_text, force=True)
+        
+    queued_tasks_count += 1
     
-    await processing_queue.put({
+    item = {
         "input_path": temp_input_path,
         "file_name": file_name,
-        "chat_id": OWNER_CHAT_ID,
-        "target_chat": chat_id,
-        "caption": caption,
-        "queue_position": queue_position,
-        "type": "video"
-    })
+        "chat_id": OWNER_CHAT_ID,      # Status updates go to Owner's Chat
+        "target_chat": chat_id,        # Final video goes to Channel
+        "caption": caption
+    }
+    await processing_queue.put(item)
     
-    return {"ok": True, "result": {"message_id": 99999, "chat": {"id": int(chat_id) if str(chat_id).replace("-", "").isdigit() else 0, "type": "private"}, "date": int(time.time()), "text": f"Queued #{queue_position}"}}
+    return {
+        "ok": True,
+        "result": {
+            "message_id": 99999,
+            "chat": {
+                "id": int(chat_id) if chat_id.replace("-", "").isdigit() else 0,
+                "type": "private"
+            },
+            "date": int(time.time()),
+            "text": "File intercepted and processing queued"
+        }
+    }
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "devices": len(connected_devices), "queue": queued_tasks_count, "admin_only": True}
+    return {"status": "ok", "devices_connected": len(connected_devices), "queued_tasks": queued_tasks_count}
