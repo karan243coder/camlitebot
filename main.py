@@ -69,6 +69,11 @@ async def lifespan(app: FastAPI):
     print("🚀 SERVER STARTED IN DIRECT-ONLY MODE")
     print("🚀 NO HD CONVERTER - ONLY ONE VIDEO PER RECORDING")
     print("🚀 NO 'HD: Skipped' MESSAGE")
+    if pyrogram_available and tg_client and tg_client.is_connected:
+        print("✅ PYROGRAM CONNECTED — Large files up to 2GB supported")
+    else:
+        print("⚠️  ⚠️  ⚠️  PYROGRAM NOT WORKING — FILES OVER 50MB WILL FAIL!  ⚠️  ⚠️  ⚠️")
+        print("    Fix: Set API_ID + API_HASH env vars in Koyeb correctly")
     print("=" * 60)
     STARTUP_PRINTED = True
 
@@ -362,12 +367,21 @@ async def do_send_one_video(video_path: str, file_name: str, chat_id: str, targe
     if not os.path.exists(thumb) or os.path.getsize(thumb) == 0:
         thumb = None
 
-    limit = 2000*1024*1024
+    # 50MB+ files require pyrogram (HTTP API hard-limit)
+    use_pyro_first = bool(pyrogram_available and tg_client and tg_client.is_connected)
     sent = False
 
-    if sz > limit:
+    if sz > 50*1024*1024 and not use_pyro_first:
+        await edit_status_throttled(chat_id, status_msg_id,
+            f"📊 **[ ERROR ]** 📊\n━━━━━━━━━━━━━━━━━━━━━━\n❌ File {sz/(1024*1024):.1f}MB hai (>50MB)\n⚠️ Pyrogram chalu nahi hai (API_ID/API_HASH missing)\nKoyeb env vars check karo!\n━━━━━━━━━━━━━━━━━━━━━━", force=True)
+        if thumb and os.path.exists(thumb):
+            try: os.remove(thumb)
+            except: pass
+        return False
+
+    if sz > 2000*1024*1024:
         dur = await get_video_duration(video_path) or 600.0
-        n = math.ceil(sz / limit)
+        n = math.ceil(sz / (2000*1024*1024))
         parts = await split_video(video_path, dur / n)
         for i, part in enumerate(parts):
             pn = os.path.basename(part)
@@ -382,9 +396,13 @@ async def do_send_one_video(video_path: str, file_name: str, chat_id: str, targe
                 try: os.remove(part)
                 except: pass
     else:
-        ok = await try_pyro_send(target_clean, video_path, caption, thumb,
-                                 (chat_id, status_msg_id, file_name, 1, 1, label_name), label_name)
-        if not ok:
+        # Pyrogram se pehle try karo (50MB+ ke liye zaroori, chhote pe bhi reliable)
+        if use_pyro_first:
+            ok = await try_pyro_send(target_clean, video_path, caption, thumb,
+                                     (chat_id, status_msg_id, file_name, 1, 1, label_name), label_name)
+            if not ok and sz <= 50*1024*1024:
+                ok = await try_http_send(target_chat, video_path, caption, thumb, file_name)
+        else:
             ok = await try_http_send(target_chat, video_path, caption, thumb, file_name)
         sent = ok
 
@@ -627,16 +645,27 @@ async def custom_upload(request: Request, chat_id: str = Form(None), caption: st
     safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in fn)
     tmp = f"/tmp/{int(time.time()*1000)}_{safe}"
     with open(tmp, "wb") as b: shutil.copyfileobj(ff.file, b)
-    print(f"[UPLOAD] {safe} ({os.path.getsize(tmp)} bytes) type={file_type} target={target}")
+    sz = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+    print(f"[UPLOAD] {safe} ({sz} bytes = {sz/(1024*1024):.1f}MB) type={file_type} target={target}")
+
+    # ⚠️  Pyrogram nahi hai aur file 50MB se upar hai → pehle hi bata do ki fail karega
+    if not (pyrogram_available and tg_client and tg_client.is_connected) and sz > 45*1024*1024:
+        try: os.remove(tmp)
+        except: pass
+        msg = (f"❌ File {sz/(1024*1024):.1f}MB hai (>50MB). Pyrogram chalu nahi hai isliye upload nahi ho payega.\n"
+               f"Koyeb me API_ID + API_HASH env vars sahi se daalo.")
+        await tg_send_message(OWNER_CHAT_ID, msg)
+        return {"ok": False, "error": "pyrogram_required", "size": sz}
+
     queued_tasks_count += 1; qp = queued_tasks_count
     mid = progress_message_ids.get(OWNER_CHAT_ID)
     if not mid:
         em = "📸" if file_type == "photo" else "⚙️"
-        mid = await tg_send_message(OWNER_CHAT_ID, f"{em} Queued #{qp}...")
+        mid = await tg_send_message(OWNER_CHAT_ID, f"{em} Queued #{qp} ({sz/(1024*1024):.1f}MB)...")
         if mid: progress_message_ids[OWNER_CHAT_ID] = mid
     await processing_queue.put({"input_path":tmp,"file_name":safe,"chat_id":OWNER_CHAT_ID,"target_chat":target,
                                "caption":caption,"queue_position":qp,"type":file_type})
-    return {"ok": True, "queue_position": qp}
+    return {"ok": True, "queue_position": qp, "size": sz}
 
 @app.post("/bot{token}/{method}")
 async def telegram_api_proxy(token: str, method: str, request: Request):
